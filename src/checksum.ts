@@ -1,7 +1,7 @@
-export function checksum(input: string | Buffer): string {
-  // Placeholder: compute a deterministic checksum for RAW payloads.
-  void input;
-  return "";
+import { createHash } from "crypto";
+
+export function checksumSha256(input: string): string {
+  return createHash("sha256").update(input, "utf8").digest("hex");
 }
 
 

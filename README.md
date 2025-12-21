@@ -17,7 +17,7 @@ Arquitectura básica:
 Build y ejecución:
 1) `npm install`
 2) `npm run build`
-3) `npm start` (usa `dist/main.js`)
+3) `npm start` (usa `dist/main.js`, realiza una única petición GET y persiste el payload RAW)
 
 El Dockerfile es solo de runtime: asume que `dist/` fue generado previamente y no compila dentro del contenedor.
 
