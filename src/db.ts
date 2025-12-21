@@ -28,8 +28,13 @@ function buildConfig(): ClientConfig {
     const user = parsed.username ? decodeURIComponent(parsed.username) : undefined;
     const database = parsed.pathname?.startsWith("/") ? parsed.pathname.slice(1) : parsed.pathname;
     const port = parsed.port ? Number(parsed.port) : 5432;
+    let host = parsed.hostname;
+    if (["postgres", "db", "base"].includes(host) && !process.env.DOCKER_ENV) {
+      console.warn(`Postgres host "${host}" not resolvable locally, falling back to localhost`);
+      host = "localhost";
+    }
     return {
-      host: parsed.hostname,
+      host,
       port,
       user,
       password,
@@ -52,7 +57,13 @@ export async function getClient(): Promise<Client> {
 
   const cfg = buildConfig();
   client = new Client(cfg);
-  await client.connect();
+  try {
+    await client.connect();
+    await client.query("SELECT 1");
+  } catch (err: any) {
+    console.error("Cannot connect to PostgreSQL. Check DATABASE_URL or container network.", { error: err?.message });
+    process.exit(1);
+  }
   return client;
 }
 

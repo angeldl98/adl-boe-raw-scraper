@@ -1,3 +1,4 @@
+import "dotenv/config";
 import { fetchRawOnce } from "./fetch";
 import { checksumSha256 } from "./checksum";
 import { persistRaw } from "./persist";
