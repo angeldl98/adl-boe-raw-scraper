@@ -110,11 +110,67 @@ async function runManual(): Promise<void> {
   const detailHrefs = await extractDetailHrefs(page);
   console.log(`[info] detail URLs found: ${detailHrefs.length}`);
 
-  if (DRY_RUN) {
-    detailHrefs.forEach((h, idx) => console.log(`[dry-run] detail ${idx + 1}: ${h}`));
-    console.log("[dry-run] Exiting before visiting detail pages.");
+  if (!DRY_RUN) {
+    console.error("[fatal] Diagnostics must run in DRY_RUN mode. Set DRY_RUN=true.");
     return;
   }
+
+  // Diagnostic: inspect listing DOM without visiting details
+  const diag = await page.evaluate(() => {
+    const bodyHtml = document.body?.innerHTML || "";
+    const snippet = bodyHtml.replace(/\\s+/g, " ").slice(0, 2000);
+    const allLinks = Array.from(document.querySelectorAll("a"));
+    const linksWithHref = allLinks.filter((a) => a.getAttribute("href"));
+    const linksContainingSubasta = linksWithHref.filter((a) =>
+      (a.textContent || "").toLowerCase().includes("subasta")
+    );
+    const elementsWithOnclick = Array.from(document.querySelectorAll("[onclick]"));
+    const keywordElems = Array.from(document.querySelectorAll("*")).filter((el) => {
+      const txt = (el.textContent || "").toLowerCase();
+      return (
+        txt.includes("subasta") ||
+        txt.includes("detalle") ||
+        txt.includes("ver") ||
+        txt.includes("expediente")
+      );
+    });
+
+    const candidateSelectors: string[] = [];
+    const anchorsVer = linksWithHref
+      .filter((a) => {
+        const href = a.getAttribute("href") || "";
+        return href.includes("ver_subasta");
+      })
+      .slice(0, 5);
+    anchorsVer.forEach((a) => {
+      const href = a.getAttribute("href") || "";
+      if (href) candidateSelectors.push(`a[href='${href}']`);
+    });
+    const onclickCandidates = elementsWithOnclick.slice(0, 5).map((_, idx) => `[onclick]:nth-of-type(${idx + 1})`);
+    candidateSelectors.push(...onclickCandidates);
+
+    return {
+      snippet,
+      total_links: allLinks.length,
+      links_with_href: linksWithHref.length,
+      links_containing_subasta: linksContainingSubasta.length,
+      elements_with_onclick: elementsWithOnclick.length,
+      keyword_elements: keywordElems.length,
+      candidate_selectors: Array.from(new Set(candidateSelectors)).slice(0, 5)
+    };
+  });
+
+  console.log("[diagnostic]");
+  console.log(`snippet: ${diag.snippet}`);
+  console.log(`total_links: ${diag.total_links}`);
+  console.log(`links_with_href: ${diag.links_with_href}`);
+  console.log(`links_containing_subasta: ${diag.links_containing_subasta}`);
+  console.log(`elements_with_onclick: ${diag.elements_with_onclick}`);
+  console.log(`keyword_elements: ${diag.keyword_elements}`);
+  console.log("possible_detail_selectors:");
+  diag.candidate_selectors.forEach((s: string) => console.log(`  - ${s}`));
+  console.log("[dry-run] Exiting after diagnostics (no visits, no persist).");
+  return;
 
   const visits = Math.min(detailHrefs.length, MAX_PAGES);
   for (let i = 0; i < visits; i++) {
