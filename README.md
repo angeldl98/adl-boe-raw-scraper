@@ -1,23 +1,27 @@
-# adl-boe-raw-scraper
+# ADL BOE RAW Scraper
 
-Repositorio mínimo y auditable para la extracción **RAW** de datos del BOE (subastas). Alcance fijo e inmutable:
+## Manual scraper (PHASE S1.5)
+Headful, IP-safe, manual-only tool to capture BOE detail pages.
 
-- Solo obtiene y persiste datos en crudo.
-- No analiza ni interpreta la información (normalización/IA ocurren aguas abajo).
-- Alimenta a sistemas posteriores (normalizer / analyst).
-- La seguridad IP es prioritaria; cualquier lógica futura debe ser respetuosa con límites y bloqueo.
+Run manually (from repo root):
 
-Arquitectura básica:
-- `src/main.ts`: punto de entrada.
-- `src/fetch.ts`: obtención futura de datos RAW.
-- `src/persist.ts`: persistencia de los datos RAW.
-- `src/checksum.ts`: utilidades de checksum.
-- `src/db.ts`: conexión y utilidades de base de datos.
+```bash
+npm install
+npx ts-node scripts/boe/manual_scrape.ts               # fetch + persist (max 5 details)
+DRY_RUN=true npx ts-node scripts/boe/manual_scrape.ts   # discovery only, no visits/persist
+```
 
-Build y ejecución:
-1) `npm install`
-2) `npm run build`
-3) `npm start` (usa `dist/main.js`, realiza una única petición GET y persiste el payload RAW)
+Requirements & rules:
+- Chromium visible (headless=false), single browser, single tab, sequential.
+- Max 5 detail pages per run. Random delay 5–10s between actions.
+- Opens https://subastas.boe.es, clicks “Buscar”, extracts up to 5 `ver_subasta` links, visits by click.
+- Stops on captcha/access denied/empty HTML/unexpected redirect/landing detected.
+- Persists to `boe_subastas_raw` (url, payload_raw, checksum, fetched_at) unless landing detected.
 
-El Dockerfile es solo de runtime: asume que `dist/` fue generado previamente y no compila dentro del contenedor.
+Landing vs detail guard:
+- Considered landing if title “Portal de Subastas Electrónicas” AND missing detail markers (“Expediente”, “Importe base”, “Tipo de subasta”). Landing pages are NOT saved and the run stops.
 
+Config:
+- Uses standard PG envs or DATABASE_URL as per `src/db.ts`.
+
+Next (automation) is not enabled yet; see `systemd/` templates for future use.

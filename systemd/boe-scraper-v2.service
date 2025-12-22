@@ -1,0 +1,18 @@
+[Unit]
+Description=BOE scraper v2 (headful, sequential, IP-safe) - template, NOT INSTALLED
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# NOTE: This service is not enabled/installed. Update paths if needed before enabling.
+# Headful run (may require DISPLAY/GUI if kept headful in automation);
+# for future automation, adapt to compiled entrypoint or xvfb if approved.
+Environment=DRY_RUN=false
+Environment=NODE_ENV=production
+WorkingDirectory=/opt/adl-suite/adl-boe-raw-scraper
+ExecStart=/usr/bin/flock -n /opt/adl-suite/locks/boe-scraper-v2.lock \
+  /usr/bin/env DRY_RUN=${DRY_RUN} /usr/bin/npm --prefix /opt/adl-suite/adl-boe-raw-scraper run scrape:manual
+Restart=no
+StandardOutput=append:/opt/adl-suite/logs/boe-scraper-v2.log
+StandardError=append:/opt/adl-suite/logs/boe-scraper-v2.log

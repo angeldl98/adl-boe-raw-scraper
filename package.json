@@ -5,7 +5,9 @@
   "main": "dist/main.js",
   "scripts": {
     "build": "tsc",
-    "start": "node dist/main.js"
+    "start": "node dist/main.js",
+    "scrape:manual": "ts-node scripts/boe/manual_scrape.ts",
+    "scrape:manual:dry": "DRY_RUN=true ts-node scripts/boe/manual_scrape.ts"
   },
   "dependencies": {
     "dotenv": "^16.4.5",

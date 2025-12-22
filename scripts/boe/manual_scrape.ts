@@ -6,19 +6,20 @@
  *
  * How to run (manual, from repo root):
  *   npm install
- *   npx ts-node scripts/boe/manual_scrape.ts
+ *   npx ts-node scripts/boe/manual_scrape.ts           # run (fetch + persist)
+ *   DRY_RUN=true npx ts-node scripts/boe/manual_scrape.ts   # discover links only, no visits/persist
  *
  * Preconditions:
  *   - Visible Chromium (headless=false).
  *   - One browser, one page.
- *   - Network stable; stop on captcha/denegado/empty body.
+ *   - Network stable; stop on captcha/denegado/empty body/landing detected.
  *   - Do NOT change limits; maxPages = 5.
  *
  * What it does:
  *   - Opens https://subastas.boe.es
  *   - Clicks “Buscar” (listing) like a user.
  *   - Extracts up to 5 detail links (href contains "ver_subasta").
- *   - Visits each by clicking the link (no direct navigation), waits for load, saves HTML to boe_subastas_raw.
+ *   - Visits each by clicking the link (no direct navigation), waits for load, saves HTML to boe_subastas_raw (unless landing detected).
  *   - Waits 5–10s between actions. Stops on any block signal.
  *
  * What it DOES NOT do:
@@ -29,6 +30,7 @@
  *   - Access denied text
  *   - Empty/too short HTML
  *   - Unexpected redirect away from subastas.boe.es
+ *   - Landing page detected (title “Portal de Subastas Electrónicas” and missing detail markers)
  */
 
 import "dotenv/config";
@@ -40,6 +42,7 @@ const MAX_PAGES = 5;
 const BASE_URL = "https://subastas.boe.es";
 const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+const DRY_RUN = process.env.DRY_RUN === "true";
 
 function randomDelayMs() {
   const seconds = 5 + Math.random() * 5; // 5-10s
@@ -57,6 +60,13 @@ function looksBlocked(html: string, url: string): string | null {
   if (lower.includes("acceso denegado") || lower.includes("access denied")) return "access_denied";
   if (!url.startsWith(BASE_URL)) return "unexpected_redirect";
   return null;
+}
+
+function looksLikeLanding(html: string): boolean {
+  const lower = html.toLowerCase();
+  const hasPortalTitle = lower.includes("portal de subastas electr");
+  const hasDetailMarkers = lower.includes("expediente") || lower.includes("importe base") || lower.includes("tipo de subasta");
+  return hasPortalTitle && !hasDetailMarkers;
 }
 
 async function extractDetailHrefs(page: Page): Promise<string[]> {
@@ -100,6 +110,12 @@ async function runManual(): Promise<void> {
   const detailHrefs = await extractDetailHrefs(page);
   console.log(`[info] detail URLs found: ${detailHrefs.length}`);
 
+  if (DRY_RUN) {
+    detailHrefs.forEach((h, idx) => console.log(`[dry-run] detail ${idx + 1}: ${h}`));
+    console.log("[dry-run] Exiting before visiting detail pages.");
+    return;
+  }
+
   const visits = Math.min(detailHrefs.length, MAX_PAGES);
   for (let i = 0; i < visits; i++) {
     const href = detailHrefs[i];
@@ -119,6 +135,11 @@ async function runManual(): Promise<void> {
     const block = looksBlocked(html, page.url());
     if (block) {
       console.error(`[error] Block signal detected (${block}); stopping.`);
+      break;
+    }
+
+    if (looksLikeLanding(html)) {
+      console.warn("[warn] Landing page detected; not saving payload. Stopping to avoid bad data.");
       break;
     }
 

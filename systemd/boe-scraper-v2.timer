@@ -1,0 +1,10 @@
+[Unit]
+Description=BOE scraper v2 schedule (template, NOT INSTALLED)
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=0
+
+[Install]
+WantedBy=timers.target
