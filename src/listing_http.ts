@@ -1,4 +1,4 @@
-import { load, CheerioAPI, Element } from "cheerio";
+import { load, CheerioAPI } from "cheerio";
 
 const BASE_URL = process.env.BOE_BASE_URL || "https://subastas.boe.es";
 const LISTING_URL = `${BASE_URL}/subastas_ava.php`;
@@ -55,7 +55,7 @@ function normalizeCookieHeader(headers: Headers): string | undefined {
 
 function extractSearchForm(html: string): SearchForm | null {
   const $: CheerioAPI = load(html);
-  const candidates = $("form").filter((_idx: number, el: Element) => {
+  const candidates = $("form").filter((_idx, el) => {
     const action = ($(el).attr("action") || "").toLowerCase();
     return action.includes("subastas_ava");
   });
@@ -63,7 +63,7 @@ function extractSearchForm(html: string): SearchForm | null {
   if (!form || form.length === 0) return null;
 
   const fields: FormField[] = [];
-  form.find("input, select, textarea").each((_idx: number, el: Element) => {
+  form.find("input, select, textarea").each((_idx, el) => {
     const name = $(el).attr("name");
     if (!name) return;
     const type = ($(el).attr("type") || "").toLowerCase();
@@ -84,7 +84,7 @@ function extractSearchForm(html: string): SearchForm | null {
 
   const submitCandidate = form
     .find("input[type='submit'], button[type='submit'], button")
-    .filter((_idx: number, el: Element) => {
+    .filter((_idx, el) => {
       const label = ($(el).attr("value") || $(el).text() || "").toLowerCase();
       return label.includes("buscar");
     })
@@ -101,6 +101,35 @@ function extractSearchForm(html: string): SearchForm | null {
     fields,
     submit
   };
+}
+
+function applyDefaults(fields: FormField[]): FormField[] {
+  const result: FormField[] = [];
+  let hasEstado = false;
+
+  for (const field of fields) {
+    if (field.name === "dato[2]") {
+      hasEstado = true;
+      // Si no hay estado elegido, forzamos "PU" (pendiente/abierta) para obtener resultados.
+      if (Array.isArray(field.value)) {
+        const allEmpty = field.value.length === 0 || field.value.every((v) => !v);
+        if (allEmpty) {
+          result.push({ name: field.name, value: "PU" });
+          continue;
+        }
+      } else if (!field.value) {
+        result.push({ name: field.name, value: "PU" });
+        continue;
+      }
+    }
+    result.push(field);
+  }
+
+  if (!hasEstado) {
+    result.push({ name: "dato[2]", value: "PU" });
+  }
+
+  return result;
 }
 
 function buildBody(form: SearchForm): URLSearchParams {
@@ -122,7 +151,7 @@ export function extractDetailLinks(html: string): ListingLink[] {
   const $: CheerioAPI = load(html);
   const seen = new Set<string>();
   const links: ListingLink[] = [];
-  $(RESULT_SELECTOR).each((_idx: number, el: Element) => {
+  $(RESULT_SELECTOR).each((_idx, el) => {
     const href = $(el).attr("href");
     if (!href) return;
     const absolute = absoluteUrl(href);
@@ -147,12 +176,14 @@ export async function fetchListingPage(): Promise<ListingFetchResult> {
     throw new Error("No se encontró el formulario de búsqueda en la página de subastas.");
   }
 
-  const body = buildBody(form);
+  const body = buildBody({ ...form, fields: applyDefaults(form.fields) });
   const res = await fetch(form.action, {
     method: form.method || "POST",
     headers: {
       "User-Agent": UA,
       "Content-Type": "application/x-www-form-urlencoded",
+      Referer: LISTING_URL,
+      Origin: BASE_URL,
       ...(cookieHeader ? { Cookie: cookieHeader } : {})
     },
     body

@@ -5,9 +5,11 @@
   "main": "dist/main.js",
   "scripts": {
     "build": "tsc",
-    "start": "node dist/main.js",
+    "start": "ts-node scripts/boe/manual_scrape.ts",
     "scrape:manual": "ts-node scripts/boe/manual_scrape.ts",
-    "scrape:manual:dry": "DRY_RUN=true ts-node scripts/boe/manual_scrape.ts"
+    "scrape:manual:dry": "DRY_RUN=true ts-node scripts/boe/manual_scrape.ts",
+    "scrape:cron": "ts-node scripts/boe/cron_scrape.ts",
+    "normalize": "ts-node scripts/boe/normalize.ts"
   },
   "dependencies": {
     "cheerio": "^1.1.2",
