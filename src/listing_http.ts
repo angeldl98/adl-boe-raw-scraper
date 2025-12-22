@@ -1,4 +1,4 @@
-import { load } from "cheerio";
+import { load, CheerioAPI, Element } from "cheerio";
 
 const BASE_URL = process.env.BOE_BASE_URL || "https://subastas.boe.es";
 const LISTING_URL = `${BASE_URL}/subastas_ava.php`;
@@ -40,20 +40,22 @@ function absoluteUrl(href: string | undefined): string {
 
 function normalizeCookieHeader(headers: Headers): string | undefined {
   const anyHeaders = headers as any;
-  const rawCookies: string[] | undefined =
+  const rawCookies: Array<string | null | undefined> | undefined =
     anyHeaders.getSetCookie?.() ||
     anyHeaders.raw?.()["set-cookie"] ||
     (headers.get("set-cookie") ? [headers.get("set-cookie")] : undefined);
 
   if (!rawCookies || rawCookies.length === 0) return undefined;
-  const parts = rawCookies.flatMap((c: string | null) => (c ? c.split(",") : [])).map((c: string) => c.split(";")[0]);
+  const parts = rawCookies
+    .flatMap((c: string | null | undefined) => (c ? c.split(",") : []))
+    .map((c: string) => c.split(";")[0]);
   const cleaned = parts.filter(Boolean);
   return cleaned.length ? cleaned.join("; ") : undefined;
 }
 
 function extractSearchForm(html: string): SearchForm | null {
-  const $ = load(html);
-  const candidates = $("form").filter((_, el) => {
+  const $: CheerioAPI = load(html);
+  const candidates = $("form").filter((_idx: number, el: Element) => {
     const action = ($(el).attr("action") || "").toLowerCase();
     return action.includes("subastas_ava");
   });
@@ -61,7 +63,7 @@ function extractSearchForm(html: string): SearchForm | null {
   if (!form || form.length === 0) return null;
 
   const fields: FormField[] = [];
-  form.find("input, select, textarea").each((_, el) => {
+  form.find("input, select, textarea").each((_idx: number, el: Element) => {
     const name = $(el).attr("name");
     if (!name) return;
     const type = ($(el).attr("type") || "").toLowerCase();
@@ -82,7 +84,7 @@ function extractSearchForm(html: string): SearchForm | null {
 
   const submitCandidate = form
     .find("input[type='submit'], button[type='submit'], button")
-    .filter((_, el) => {
+    .filter((_idx: number, el: Element) => {
       const label = ($(el).attr("value") || $(el).text() || "").toLowerCase();
       return label.includes("buscar");
     })
@@ -117,10 +119,10 @@ function buildBody(form: SearchForm): URLSearchParams {
 }
 
 export function extractDetailLinks(html: string): ListingLink[] {
-  const $ = load(html);
+  const $: CheerioAPI = load(html);
   const seen = new Set<string>();
   const links: ListingLink[] = [];
-  $(RESULT_SELECTOR).each((_, el) => {
+  $(RESULT_SELECTOR).each((_idx: number, el: Element) => {
     const href = $(el).attr("href");
     if (!href) return;
     const absolute = absoluteUrl(href);
