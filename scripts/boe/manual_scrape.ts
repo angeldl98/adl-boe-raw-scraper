@@ -1,20 +1,21 @@
 /**
- * BOE manual scraper v2 (PHASE S1.10) - listing flow fix
- * DO NOT RUN AUTOMATICALLY. Manual, supervised runs only.
- * IP SAFETY FIRST: headful, single tab, sequential, max 5 detail pages, 5–10s random delays.
+ * BOE manual scraper v2 (PHASE S1.11)
+ * Arquitectura final:
+ *   - LISTADO solo vía HTTP (subastas_ava.php con POST real)
+ *   - DETALLE solo con Playwright headful (xvfb) y una pestaña
+ *   - Secuencial, 5–10s de espera aleatoria, máximo 5 detalles por ejecución
+ *   - Guardarraíles: CAPTCHA/denegado/redirecciones/landing vacía, marcadores de detalle obligatorios
  *
- * How to run (manual, from repo root):
+ * Cómo ejecutar manualmente (no automatizar):
  *   npm install
- *   DRY_RUN=true npx ts-node scripts/boe/manual_scrape.ts   # discovery only (no clicks into details)
- *   npx ts-node scripts/boe/manual_scrape.ts                # detail clicks/persist ONLY if explicitly approved
+ *   DRY_RUN=true npx ts-node scripts/boe/manual_scrape.ts   # solo listado HTTP + logs, sin Playwright
+ *   npx ts-node scripts/boe/manual_scrape.ts                # listado HTTP + detalles con Playwright (solo si aprobado)
  *
- * Flow (must mimic human):
- *   - Go to https://subastas.boe.es/subastas_ava.php
- *   - Wait for search form, click real “Buscar” submit button (no handcrafted URLs)
- *   - Wait for navigation + results container div.listadoResult
- *   - Collect li.resultado-busqueda a.resultado-busqueda-link-defecto (max 5)
- *   - DRY_RUN: log count, href, snippet; STOP (no detail clicks)
- *   - Real run: click each anchor, wait navigation, guard checks, persist if detail markers present
+ * Flujo:
+ *   1) Fetch HTTP de https://subastas.boe.es/subastas_ava.php, submit real del formulario
+ *   2) Parsear li.resultado-busqueda a.resultado-busqueda-link-defecto -> enlaces detalle
+ *   3) DRY_RUN: log de cantidad, href, snippet; STOP (sin Playwright)
+ *   4) Real: Playwright headful solo para detalles conocidos; persistir solo si hay marcadores
  *
  * Safety stop conditions:
  *   - CAPTCHA / access denied / empty HTML / redirect outside subastas.boe.es
@@ -23,18 +24,16 @@
  */
 
 import "dotenv/config";
-import { chromium, Browser, Page } from "playwright";
+import { chromium, Browser } from "playwright";
 import { persistRaw } from "../../src/persist";
 import { checksumSha256 } from "../../src/checksum";
+import { fetchListingPage, ListingLink } from "../../src/listing_http";
 
 const MAX_PAGES = 5;
 const BASE_URL = "https://subastas.boe.es";
-const LISTING_URL = `${BASE_URL}/subastas_ava.php`;
 const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const DRY_RUN = process.env.DRY_RUN === "true";
-const RESULT_ITEM = "li.resultado-busqueda";
-const RESULT_LINK = "li.resultado-busqueda a.resultado-busqueda-link-defecto";
 
 function randomDelayMs() {
   const seconds = 5 + Math.random() * 5; // 5-10s
@@ -69,74 +68,41 @@ function hasDetailMarkers(html: string): boolean {
   return hasId && hasTipo && hasImporte;
 }
 
-async function scrollListing(page: Page) {
-  // Light, human-like scroll to load visible items
-  await page.mouse.wheel(0, 800);
-  await safeWait(800 + Math.random() * 400);
-  await page.mouse.wheel(0, 800);
-  await safeWait(500 + Math.random() * 400);
-}
-
 async function runManual(): Promise<void> {
-  console.log("[info] Starting manual BOE scrape (headful, max 5 pages)");
+  console.log("[info] Inicio: listado HTTP + detalles con Playwright (máx 5)");
+
+  const listing = await fetchListingPage();
+  console.log(`[info] Listado obtenido desde ${listing.url}, html=${listing.html.length} chars`);
+  console.log(`[info] Enlaces de detalle detectados: ${listing.links.length}`);
+
+  const selected: ListingLink[] = listing.links.slice(0, MAX_PAGES);
+
+  if (!DRY_RUN) {
+    const listingChecksum = checksumSha256(listing.html);
+    await persistRaw({ url: listing.url, payload: listing.html, checksum: listingChecksum, source: "BOE_LISTING" });
+  }
+
+  if (DRY_RUN) {
+    for (let i = 0; i < selected.length; i++) {
+      const link = selected[i];
+      const text = link.text.replace(/\s+/g, " ").slice(0, 200);
+      console.log(`[dry-run] resultado ${i + 1}/${selected.length} href=${link.absolute}`);
+      console.log(`[dry-run] text: ${text}`);
+    }
+    console.log("[dry-run] STOP (solo listado HTTP, sin Playwright de detalle).");
+    return;
+  }
 
   const browser: Browser = await chromium.launch({ headless: false, args: ["--no-sandbox"] });
   const context = await browser.newContext({ userAgent: USER_AGENT, viewport: { width: 1280, height: 800 } });
   const page = await context.newPage();
 
-  await page.goto(LISTING_URL, { waitUntil: "networkidle" });
-  await safeWait(randomDelayMs());
-
-  // Wait for the search form and real submit button
-  const submitBtn = page.locator("input[type='submit'], button:has-text('Buscar')").first();
-  try {
-    await submitBtn.waitFor({ timeout: 15000 });
-  } catch {
-    console.error("[error] Search submit button not found");
-    return;
-  }
-
-  await Promise.all([page.waitForNavigation({ waitUntil: "networkidle" }), submitBtn.click()]);
-
-  // Wait for results container
-  try {
-    await page.waitForSelector("div.listadoResult", { timeout: 15000 });
-  } catch {
-    console.error("[error] Results container not found (div.listadoResult)");
-    return;
-  }
-
-  await scrollListing(page);
-
-  try {
-    await page.waitForSelector(RESULT_ITEM, { timeout: 15000 });
-  } catch {
-    console.error(`[error] Result items not found: ${RESULT_ITEM}`);
-    return;
-  }
-
-  const links = await page.$$(RESULT_LINK);
-  const targets = links.slice(0, MAX_PAGES);
-  console.log(`[info] result links found: ${links.length}, will process: ${targets.length}`);
-
-  if (DRY_RUN) {
-    for (let i = 0; i < targets.length; i++) {
-      const href = await targets[i].getAttribute("href");
-      const text = (await targets[i].innerText()).replace(/\s+/g, " ").slice(0, 200);
-      console.log(`[dry-run] would click result ${i + 1}/${targets.length} href=${href}`);
-      console.log(`[dry-run] text: ${text}`);
-    }
-    console.log("[dry-run] Exiting (no clicks, no visits, no persist).");
-    return;
-  }
-
-  const visits = targets.length;
-  for (let i = 0; i < visits; i++) {
-    const href = await targets[i].getAttribute("href");
-    console.log(`[info] Visiting result ${i + 1}/${visits} via anchor href=${href}`);
+  for (let i = 0; i < selected.length; i++) {
+    const link = selected[i];
+    console.log(`[info] Visitando detalle ${i + 1}/${selected.length}: ${link.absolute}`);
     await safeWait(randomDelayMs());
 
-    await Promise.all([page.waitForNavigation({ waitUntil: "networkidle" }), targets[i].click()]);
+    await page.goto(link.absolute, { waitUntil: "networkidle" });
 
     const html = await page.content();
     const block = looksBlocked(html, page.url());
@@ -156,14 +122,11 @@ async function runManual(): Promise<void> {
     }
 
     const checksum = checksumSha256(html);
-    await persistRaw({ url: page.url(), payload: html, checksum });
+    await persistRaw({ url: page.url(), payload: html, checksum, source: "BOE_DETAIL" });
     console.log(`[info] saved payload for ${page.url()}`);
-
-    // Return to listing for next link
-    await Promise.all([page.waitForNavigation({ waitUntil: "networkidle" }), page.goBack()]);
   }
 
-  console.log("[info] Done (manual run). Close the browser manually if needed.");
+  console.log("[info] Done (manual run). El navegador queda abierto para supervisión manual.");
 }
 
 // Entry point for manual invocation only. Do NOT automate.

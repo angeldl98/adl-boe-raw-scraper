@@ -1,25 +1,26 @@
 # ADL BOE RAW Scraper
 
-## Manual scraper (PHASE S1.5)
-Headful, IP-safe, manual-only tool to capture BOE detail pages.
+## Manual scraper (PHASE S1.11)
+Headful, IP-safe, manual-only tool to capturar listado + detalles BOE.
 
 Run manually (from repo root):
 
 ```bash
 npm install
-npx ts-node scripts/boe/manual_scrape.ts               # fetch + persist (max 5 details)
-DRY_RUN=true npx ts-node scripts/boe/manual_scrape.ts   # discovery only, no visits/persist
+npx ts-node scripts/boe/manual_scrape.ts               # listado HTTP + detalles Playwright (max 5)
+DRY_RUN=true npx ts-node scripts/boe/manual_scrape.ts   # solo listado HTTP, logs, sin Playwright
 ```
 
-Requirements & rules:
-- Chromium visible (headless=false), single browser, single tab, sequential.
-- Max 5 detail pages per run. Random delay 5–10s between actions.
-- Opens https://subastas.boe.es, clicks “Buscar”, extracts up to 5 `ver_subasta` links, visits by click.
+Requisitos y reglas:
+- Listado vía HTTP: submit real del formulario en `subastas_ava.php` y parseo de `li.resultado-busqueda a.resultado-busqueda-link-defecto`.
+- Chromium visible (headless=false) **solo para detalles**, una pestaña, secuencial.
+- Máx 5 páginas de detalle por run. Espera aleatoria 5–10s entre visitas de detalle.
 - Stops on captcha/access denied/empty HTML/unexpected redirect/landing detected.
-- Persists to `boe_subastas_raw` (url, payload_raw, checksum, fetched_at) unless landing detected.
+- Persiste listado (`fuente=BOE_LISTING`) y detalle (`fuente=BOE_DETAIL`) en `boe_subastas_raw` solo si pasan los marcadores de detalle.
 
-Landing vs detail guard:
-- Considered landing if title “Portal de Subastas Electrónicas” AND missing detail markers (“Expediente”, “Importe base”, “Tipo de subasta”). Landing pages are NOT saved and the run stops.
+Marcadores/guardarraíles:
+- Detalle válido solo si contiene “Identificador”, “Tipo de subasta” y uno de (“Importe del depósito”, “Valor subasta”).
+- Considerado landing si título “Portal de Subastas Electrónicas” y faltan marcadores; no se guarda y se detiene.
 
 Config:
 - Uses standard PG envs or DATABASE_URL as per `src/db.ts`.

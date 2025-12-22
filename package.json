@@ -10,6 +10,7 @@
     "scrape:manual:dry": "DRY_RUN=true ts-node scripts/boe/manual_scrape.ts"
   },
   "dependencies": {
+    "cheerio": "^1.1.2",
     "dotenv": "^16.4.5",
     "pg": "^8.12.0"
   },
