@@ -1,13 +1,13 @@
 /**
- * BOE manual scraper v2 (PHASE S1.5/S1.7)
- * ---------------------------------------
+ * BOE manual scraper v2 (PHASE S1.9)
+ * -----------------------------------
  * DO NOT RUN AUTOMATICALLY. Manual, supervised runs only.
  * IP SAFETY FIRST: headful, single tab, sequential, max 5 detail pages, 5–10s random delays.
  *
  * How to run (manual, from repo root):
  *   npm install
- *   npx ts-node scripts/boe/manual_scrape.ts           # run (fetch + persist)
- *   DRY_RUN=true npx ts-node scripts/boe/manual_scrape.ts   # discovery/diagnostic only (no clicks, no persist)
+ *   npx ts-node scripts/boe/manual_scrape.ts           # run (fetch + persist) [only when explicitly approved]
+ *   DRY_RUN=true npx ts-node scripts/boe/manual_scrape.ts   # discovery only (no clicks, no persist)
  *
  * Preconditions:
  *   - Visible Chromium (headless=false).
@@ -15,16 +15,17 @@
  *   - Network stable; stop on captcha/denegado/empty body/landing detected.
  *   - Do NOT change limits; maxPages = 5.
  *
+ * Listing facts (static HTML):
+ *   - Results: li.resultado-busqueda
+ *   - Link: a.resultado-busqueda-link-defecto (href like ./detalleSubasta.php?...)
+ *
  * What it does:
  *   - Opens https://subastas.boe.es
  *   - Clicks “Buscar” (listing) like a user.
- *   - Waits for result items with onclick (selector: [onclick*="ver_subasta"]).
- *   - DRY_RUN: logs items that would be clicked; exits.
- *   - Real run: clicks each item (no direct navigation), waits load, saves HTML to boe_subastas_raw (unless landing detected).
+ *   - Waits for li.resultado-busqueda, collects up to 5 anchors a.resultado-busqueda-link-defecto.
+ *   - DRY_RUN: logs would-click, href, innerText (200 chars), no clicks.
+ *   - Real run: clicks anchor (no goto), waits navigation, saves HTML to boe_subastas_raw if guards pass.
  *   - Waits 5–10s between actions. Stops on any block signal.
- *
- * What it DOES NOT do:
- *   - No normalization, no analyst, no PDFs, no retries, no pagination loops.
  *
  * Safety stop conditions:
  *   - CAPTCHA text detected
@@ -32,6 +33,7 @@
  *   - Empty/too short HTML
  *   - Unexpected redirect away from subastas.boe.es
  *   - Landing page detected (title “Portal de Subastas Electrónicas” and missing detail markers)
+ *   - Detail content must contain expected markers: “Identificador”, “Tipo de subasta”, and one of (“Importe del depósito”, “Valor subasta”) to persist.
  */
 
 import "dotenv/config";
@@ -44,7 +46,8 @@ const BASE_URL = "https://subastas.boe.es";
 const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const DRY_RUN = process.env.DRY_RUN === "true";
-const RESULT_SELECTOR = '[onclick*="ver_subasta"]';
+const RESULT_ITEM = "li.resultado-busqueda";
+const RESULT_LINK = "li.resultado-busqueda a.resultado-busqueda-link-defecto";
 
 function randomDelayMs() {
   const seconds = 5 + Math.random() * 5; // 5-10s
@@ -69,6 +72,14 @@ function looksLikeLanding(html: string): boolean {
   const hasPortalTitle = lower.includes("portal de subastas electr");
   const hasDetailMarkers = lower.includes("expediente") || lower.includes("importe base") || lower.includes("tipo de subasta");
   return hasPortalTitle && !hasDetailMarkers;
+}
+
+function hasDetailMarkers(html: string): boolean {
+  const lower = html.toLowerCase();
+  const hasId = lower.includes("identificador");
+  const hasTipo = lower.includes("tipo de subasta");
+  const hasImporte = lower.includes("importe del dep") || lower.includes("valor subasta");
+  return hasId && hasTipo && hasImporte;
 }
 
 async function scrollListing(page: Page) {
@@ -100,19 +111,22 @@ async function runManual(): Promise<void> {
   await scrollListing(page);
 
   try {
-    await page.waitForSelector(RESULT_SELECTOR, { timeout: 15000 });
+    await page.waitForSelector(RESULT_ITEM, { timeout: 15000 });
   } catch {
-    console.error(`[error] Result selector not found: ${RESULT_SELECTOR}`);
+    console.error(`[error] Result items not found: ${RESULT_ITEM}`);
     return;
   }
 
-  const resultHandles = await page.$$(RESULT_SELECTOR);
-  const targets = resultHandles.slice(0, MAX_PAGES);
-  console.log(`[info] result items found: ${resultHandles.length}, will process: ${targets.length}`);
+  const links = await page.$$(RESULT_LINK);
+  const targets = links.slice(0, MAX_PAGES);
+  console.log(`[info] result links found: ${links.length}, will process: ${targets.length}`);
 
   if (DRY_RUN) {
     for (let i = 0; i < targets.length; i++) {
-      console.log(`[dry-run] would click result ${i + 1}/${targets.length} using selector ${RESULT_SELECTOR}`);
+      const href = await targets[i].getAttribute("href");
+      const text = (await targets[i].innerText()).replace(/\s+/g, " ").slice(0, 200);
+      console.log(`[dry-run] would click result ${i + 1}/${targets.length} href=${href}`);
+      console.log(`[dry-run] text: ${text}`);
     }
     console.log("[dry-run] Exiting (no clicks, no visits, no persist).");
     return;
@@ -120,7 +134,8 @@ async function runManual(): Promise<void> {
 
   const visits = targets.length;
   for (let i = 0; i < visits; i++) {
-    console.log(`[info] Visiting result ${i + 1}/${visits} via onclick element`);
+    const href = await targets[i].getAttribute("href");
+    console.log(`[info] Visiting result ${i + 1}/${visits} via anchor href=${href}`);
     await safeWait(randomDelayMs());
 
     await Promise.all([page.waitForNavigation({ waitUntil: "networkidle" }), targets[i].click()]);
@@ -134,6 +149,11 @@ async function runManual(): Promise<void> {
 
     if (looksLikeLanding(html)) {
       console.warn("[warn] Landing page detected; not saving payload. Stopping to avoid bad data.");
+      break;
+    }
+
+    if (!hasDetailMarkers(html)) {
+      console.warn("[warn] Detail markers missing (Identificador/Tipo/Importe); not saving.");
       break;
     }
 
