@@ -1,39 +1,25 @@
 /**
- * BOE manual scraper v2 (PHASE S1.9)
- * -----------------------------------
+ * BOE manual scraper v2 (PHASE S1.10) - listing flow fix
  * DO NOT RUN AUTOMATICALLY. Manual, supervised runs only.
  * IP SAFETY FIRST: headful, single tab, sequential, max 5 detail pages, 5–10s random delays.
  *
  * How to run (manual, from repo root):
  *   npm install
- *   npx ts-node scripts/boe/manual_scrape.ts           # run (fetch + persist) [only when explicitly approved]
- *   DRY_RUN=true npx ts-node scripts/boe/manual_scrape.ts   # discovery only (no clicks, no persist)
+ *   DRY_RUN=true npx ts-node scripts/boe/manual_scrape.ts   # discovery only (no clicks into details)
+ *   npx ts-node scripts/boe/manual_scrape.ts                # detail clicks/persist ONLY if explicitly approved
  *
- * Preconditions:
- *   - Visible Chromium (headless=false).
- *   - One browser, one page.
- *   - Network stable; stop on captcha/denegado/empty body/landing detected.
- *   - Do NOT change limits; maxPages = 5.
- *
- * Listing facts (static HTML):
- *   - Results: li.resultado-busqueda
- *   - Link: a.resultado-busqueda-link-defecto (href like ./detalleSubasta.php?...)
- *
- * What it does:
- *   - Opens https://subastas.boe.es
- *   - Clicks “Buscar” (listing) like a user.
- *   - Waits for li.resultado-busqueda, collects up to 5 anchors a.resultado-busqueda-link-defecto.
- *   - DRY_RUN: logs would-click, href, innerText (200 chars), no clicks.
- *   - Real run: clicks anchor (no goto), waits navigation, saves HTML to boe_subastas_raw if guards pass.
- *   - Waits 5–10s between actions. Stops on any block signal.
+ * Flow (must mimic human):
+ *   - Go to https://subastas.boe.es/subastas_ava.php
+ *   - Wait for search form, click real “Buscar” submit button (no handcrafted URLs)
+ *   - Wait for navigation + results container div.listadoResult
+ *   - Collect li.resultado-busqueda a.resultado-busqueda-link-defecto (max 5)
+ *   - DRY_RUN: log count, href, snippet; STOP (no detail clicks)
+ *   - Real run: click each anchor, wait navigation, guard checks, persist if detail markers present
  *
  * Safety stop conditions:
- *   - CAPTCHA text detected
- *   - Access denied text
- *   - Empty/too short HTML
- *   - Unexpected redirect away from subastas.boe.es
- *   - Landing page detected (title “Portal de Subastas Electrónicas” and missing detail markers)
- *   - Detail content must contain expected markers: “Identificador”, “Tipo de subasta”, and one of (“Importe del depósito”, “Valor subasta”) to persist.
+ *   - CAPTCHA / access denied / empty HTML / redirect outside subastas.boe.es
+ *   - Landing page detected (title “Portal de Subastas Electrónicas” w/o markers)
+ *   - Detail must contain markers: “Identificador”, “Tipo de subasta”, and one of (“Importe del depósito”, “Valor subasta”) to persist
  */
 
 import "dotenv/config";
@@ -43,6 +29,7 @@ import { checksumSha256 } from "../../src/checksum";
 
 const MAX_PAGES = 5;
 const BASE_URL = "https://subastas.boe.es";
+const LISTING_URL = `${BASE_URL}/subastas_ava.php`;
 const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const DRY_RUN = process.env.DRY_RUN === "true";
@@ -97,15 +84,26 @@ async function runManual(): Promise<void> {
   const context = await browser.newContext({ userAgent: USER_AGENT, viewport: { width: 1280, height: 800 } });
   const page = await context.newPage();
 
-  await page.goto(BASE_URL, { waitUntil: "networkidle" });
+  await page.goto(LISTING_URL, { waitUntil: "networkidle" });
   await safeWait(randomDelayMs());
 
-  // Click "Buscar" to reach listing (no direct nav)
-  const buscar = page.locator("a:has-text('Buscar')").first();
-  if (await buscar.count()) {
-    await Promise.all([page.waitForNavigation({ waitUntil: "networkidle" }), buscar.click()]);
-  } else {
-    console.warn("[warn] Buscar link not found; staying on home");
+  // Wait for the search form and real submit button
+  const submitBtn = page.locator("input[type='submit'], button:has-text('Buscar')").first();
+  try {
+    await submitBtn.waitFor({ timeout: 15000 });
+  } catch {
+    console.error("[error] Search submit button not found");
+    return;
+  }
+
+  await Promise.all([page.waitForNavigation({ waitUntil: "networkidle" }), submitBtn.click()]);
+
+  // Wait for results container
+  try {
+    await page.waitForSelector("div.listadoResult", { timeout: 15000 });
+  } catch {
+    console.error("[error] Results container not found (div.listadoResult)");
+    return;
   }
 
   await scrollListing(page);
