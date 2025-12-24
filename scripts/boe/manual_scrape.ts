@@ -1,9 +1,8 @@
 /**
  * BOE manual scraper v2 (PHASE S1.11)
  * Arquitectura final:
- *   - LISTADO solo vía HTTP (subastas_ava.php con POST real)
- *   - DETALLE solo con Playwright headful (xvfb) y una pestaña
- *   - Secuencial, 5–10s de espera aleatoria, máximo 5 detalles por ejecución
+ *   - LISTADO y DETALLE con Playwright (subastas_ava.php, cookies aceptadas)
+ *   - Una pestaña, secuencial, 5–10s de espera aleatoria, máximo 5 detalles por ejecución
  *   - Guardarraíles: CAPTCHA/denegado/redirecciones/landing vacía, marcadores de detalle obligatorios
  *
  * Cómo ejecutar manualmente (no automatizar):
@@ -12,10 +11,10 @@
  *   npx ts-node scripts/boe/manual_scrape.ts                # listado HTTP + detalles con Playwright (solo si aprobado)
  *
  * Flujo:
- *   1) Fetch HTTP de https://subastas.boe.es/subastas_ava.php, submit real del formulario
+ *   1) Playwright abre https://subastas.boe.es/subastas_ava.php, acepta cookies y pulsa Buscar (dato[2]=PU si vacío)
  *   2) Parsear li.resultado-busqueda a.resultado-busqueda-link-defecto -> enlaces detalle
- *   3) DRY_RUN: log de cantidad, href, snippet; STOP (sin Playwright)
- *   4) Real: Playwright headful solo para detalles conocidos; persistir solo si hay marcadores
+ *   3) DRY_RUN: log de cantidad, href, snippet; STOP (sin detalles)
+ *   4) Real: Playwright headful para detalles conocidos; persistir solo si hay marcadores
  *
  * Safety stop conditions:
  *   - CAPTCHA / access denied / empty HTML / redirect outside subastas.boe.es

@@ -1,6 +1,6 @@
 /**
  * BOE cron scraper (headless, producción).
- * Usa el mismo flujo que el manual: listado HTTP + detalles Playwright.
+ * Usa el mismo flujo que el manual: listado + detalles via Playwright.
  * Sin DRY_RUN. Máx 5 detalles, 5–10s entre visitas, guardarraíles activos.
  */
 import "dotenv/config";
