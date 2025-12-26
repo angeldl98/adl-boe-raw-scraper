@@ -30,6 +30,9 @@ const DETAIL_DELAY_MS = 4000; // fijo, sin aleatoriedad
 const MAX_RUNTIME_MS = 8 * 60 * 1000; // 8 minutos de guardarraíl
 const MAX_REQUESTS = 1 + 2 * MAX_DETAILS_CAP; // listado + detalle + lotes
 const LOT_DELAY_MS = 1000; // breve pausa antes de cargar lotes
+const PDF_DELAY_MS = 4000; // retraso fijo antes de descargar PDF
+const PDF_MAX_BYTES = 12 * 1024 * 1024; // 12MB límite duro
+const PDF_TIMEOUT_MS = 30_000; // 30s por PDF
 
 function formatDateInput(date: Date): string {
   return date.toISOString().slice(0, 10);
@@ -293,6 +296,7 @@ function extractPdfLinks(html: string, pageUrl: string): string[] {
     const href = match[1];
     if (!href) continue;
     const absolute = new URL(href, pageUrl).toString();
+    if (!absolute.startsWith(BASE_URL)) continue; // solo dominio BOE
     if (absolute.includes("Condiciones_procedimientos_enajenacion")) continue; // descartar PDF genérico
     results.add(absolute);
   }
@@ -315,20 +319,57 @@ async function persistPdf(rawId: number, boeUid: string | null, pdfUrl: string, 
   );
 }
 
-async function downloadFirstPdf(html: string, pageUrl: string, rawId: number): Promise<void> {
-  const links = extractPdfLinks(html, pageUrl);
-  if (!links.length) return;
+async function downloadFirstPdf(
+  boeUid: string | null,
+  rawId: number | null,
+  links: string[]
+): Promise<{ filePath: string; checksum: string } | null> {
+  if (!boeUid) return null;
+  if (!links.length) return null;
   const pdfUrl = links[0];
-  const res = await fetch(pdfUrl, { method: "GET" });
-  if (!res.ok) {
-    throw new Error(`PDF_DOWNLOAD_FAILED status=${res.status}`);
+  await safeWait(PDF_DELAY_MS);
+
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), PDF_TIMEOUT_MS);
+  try {
+    const res = await fetch(pdfUrl, { method: "GET", signal: controller.signal });
+    if (!res.ok) {
+      throw new Error(`PDF_DOWNLOAD_FAILED status=${res.status}`);
+    }
+    const ct = res.headers.get("content-type") || "";
+    if (!ct.toLowerCase().includes("application/pdf")) {
+      throw new Error(`PDF_NOT_PDF content_type=${ct}`);
+    }
+    const len = Number(res.headers.get("content-length") || "0");
+    if (len > PDF_MAX_BYTES) {
+      throw new Error(`PDF_TOO_LARGE content_length=${len}`);
+    }
+    const arrayBuf = await res.arrayBuffer();
+    const buffer = Buffer.from(arrayBuf);
+    if (buffer.byteLength > PDF_MAX_BYTES) {
+      throw new Error(`PDF_TOO_LARGE body_length=${buffer.byteLength}`);
+    }
+    const checksum = checksumSha256(buffer.toString("binary"));
+    const destDir = path.join("/opt/adl-suite/data/boe_pdfs", boeUid);
+    ensureDir(destDir);
+    const filePath = path.join(destDir, `${checksum}.pdf`);
+    fs.writeFileSync(filePath, buffer);
+    if (rawId !== null) {
+      const client = await getClient();
+      await client.query(
+        `
+          INSERT INTO boe_subastas_pdfs (raw_id, boe_uid, pdf_type, file_path, checksum, fetched_at)
+          VALUES ($1,$2,$3,$4,$5, now())
+          ON CONFLICT (raw_id, checksum) DO NOTHING
+        `,
+        [rawId, boeUid, "pdf", filePath, checksum]
+      );
+    }
+    console.log(`[info] pdf_saved url=${pdfUrl} boe_uid=${boeUid} bytes=${buffer.length}`);
+    return { filePath, checksum };
+  } finally {
+    clearTimeout(t);
   }
-  const arrayBuf = await res.arrayBuffer();
-  const buffer = Buffer.from(arrayBuf);
-  const checksum = checksumSha256(buffer.toString("binary"));
-  const boeUid = deriveBoeUid(pageUrl, html);
-  await persistPdf(rawId, boeUid, pdfUrl, buffer, checksum);
-  console.log(`[info] pdf_saved url=${pdfUrl} raw_id=${rawId} bytes=${buffer.length}`);
 }
 
 function parseEuroToNumber(val: string | null | undefined): number | null {
@@ -423,6 +464,7 @@ export async function runScrape(options: ScrapeOptions): Promise<void> {
         const lotHtml = await page.content();
         const lotVals = extractLotValues(lotHtml);
         const lotSum = lotVals.length ? lotVals.reduce((a, b) => a + b, 0) : null;
+        const pdfLinks = [...extractPdfLinks(html, page.url()), ...extractPdfLinks(lotHtml, lotUrl)];
 
         // Volver a detalle para persistir el HTML enriquecido (opcional para coherencia visual)
         await page.goto(link.absolute, { waitUntil: "domcontentloaded" });
@@ -438,7 +480,8 @@ export async function runScrape(options: ScrapeOptions): Promise<void> {
             : detailHtml;
 
         const rawId = await persistRaw({ url: page.url(), payload: augmentedHtml, checksum, source: "BOE_DETAIL" });
-        await downloadFirstPdf(augmentedHtml, page.url(), rawId).catch((err) => {
+        const boeUid = deriveBoeUid(page.url(), augmentedHtml);
+        await downloadFirstPdf(boeUid, rawId, pdfLinks).catch((err) => {
           console.warn(`[warn] pdf_skip raw_id=${rawId} err=${err?.message || err}`);
         });
         console.log(
