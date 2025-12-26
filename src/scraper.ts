@@ -5,6 +5,7 @@ import { persistRaw } from "./persist";
 import { getClient } from "./db";
 import fs from "fs";
 import path from "path";
+import { URL } from "url";
 
 const BASE_URL = process.env.BOE_BASE_URL || "https://subastas.boe.es";
 const LISTING_URL = `${BASE_URL}/subastas_ava.php`;
@@ -27,7 +28,8 @@ const MAX_DETAILS_DEFAULT = Number.isFinite(Number(process.env.BOE_MAX_DETAILS))
 const MAX_DETAILS_CAP = 25;
 const DETAIL_DELAY_MS = 4000; // fijo, sin aleatoriedad
 const MAX_RUNTIME_MS = 8 * 60 * 1000; // 8 minutos de guardarraíl
-const MAX_REQUESTS = 1 + MAX_DETAILS_CAP; // listado + detalles
+const MAX_REQUESTS = 1 + 2 * MAX_DETAILS_CAP; // listado + detalle + lotes
+const LOT_DELAY_MS = 1000; // breve pausa antes de cargar lotes
 
 function formatDateInput(date: Date): string {
   return date.toISOString().slice(0, 10);
@@ -329,6 +331,33 @@ async function downloadFirstPdf(html: string, pageUrl: string, rawId: number): P
   console.log(`[info] pdf_saved url=${pdfUrl} raw_id=${rawId} bytes=${buffer.length}`);
 }
 
+function parseEuroToNumber(val: string | null | undefined): number | null {
+  if (!val) return null;
+  const cleaned = val.replace(/[^\d.,]/g, "").replace(/\.(?=\d{3}\b)/g, "").replace(",", ".");
+  const num = Number(cleaned);
+  return Number.isFinite(num) ? num : null;
+}
+
+function extractLotValues(html: string): number[] {
+  const regex = /Valor\s+Subasta<\/th>\s*<td>\s*([^<]+)\s*</gi;
+  const values: number[] = [];
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(html)) !== null) {
+    const val = parseEuroToNumber(match[1]);
+    if (val !== null) values.push(val);
+  }
+  return values;
+}
+
+function buildLotUrl(detailUrl: string, idBus?: string | null): string {
+  const u = new URL(detailUrl);
+  u.searchParams.set("ver", "3");
+  if (idBus && !u.searchParams.get("idBus")) {
+    u.searchParams.set("idBus", idBus);
+  }
+  return u.toString();
+}
+
 export async function runScrape(options: ScrapeOptions): Promise<void> {
   const maxPagesRequested = options.maxPages ?? DEFAULT_MAX_PAGES;
   const maxPages = Math.min(maxPagesRequested, MAX_PAGES_CAP);
@@ -345,6 +374,7 @@ export async function runScrape(options: ScrapeOptions): Promise<void> {
     requestCount += 1;
     console.log(`[info] Listado obtenido desde ${listing.url}, html=${listing.html.length} chars`);
     console.log(`[info] Enlaces de detalle detectados: ${listing.links.length}`);
+    const idBusListado = (listing as any).idBusqueda || null;
 
     if (!options.dryRun) {
       const listingChecksum = checksumSha256(listing.html);
@@ -385,12 +415,35 @@ export async function runScrape(options: ScrapeOptions): Promise<void> {
       }
 
       if (!options.dryRun) {
-        const checksum = checksumSha256(html);
-        const rawId = await persistRaw({ url: page.url(), payload: html, checksum, source: "BOE_DETAIL" });
-        await downloadFirstPdf(html, page.url(), rawId).catch((err) => {
+        // Lotes: obtener valor_subasta desde ver=3
+        const lotUrl = buildLotUrl(page.url(), idBusListado);
+        await safeWait(LOT_DELAY_MS);
+        await page.goto(lotUrl, { waitUntil: "domcontentloaded" });
+        await page.waitForLoadState("networkidle");
+        const lotHtml = await page.content();
+        const lotVals = extractLotValues(lotHtml);
+        const lotSum = lotVals.length ? lotVals.reduce((a, b) => a + b, 0) : null;
+
+        // Volver a detalle para persistir el HTML enriquecido (opcional para coherencia visual)
+        await page.goto(link.absolute, { waitUntil: "domcontentloaded" });
+        await page.waitForLoadState("networkidle");
+        const detailHtml = await page.content();
+
+        const checksum = checksumSha256(detailHtml);
+        const augmentedHtml =
+          lotSum !== null
+            ? `${detailHtml}\n<!-- lot_valor_subasta_sum=${lotSum.toFixed(2)} -->\n<div>Valor subasta (lotes): ${lotSum.toFixed(
+                2
+              )} €</div>\n`
+            : detailHtml;
+
+        const rawId = await persistRaw({ url: page.url(), payload: augmentedHtml, checksum, source: "BOE_DETAIL" });
+        await downloadFirstPdf(augmentedHtml, page.url(), rawId).catch((err) => {
           console.warn(`[warn] pdf_skip raw_id=${rawId} err=${err?.message || err}`);
         });
-        console.log(`[info] detail_ok url=${page.url()} bytes=${html.length}`);
+        console.log(
+          `[info] detail_ok url=${page.url()} bytes=${detailHtml.length} lot_sum=${lotSum !== null ? lotSum.toFixed(2) : "null"}`
+        );
       }
       requestCount += 1;
     }
