@@ -5,9 +5,17 @@
  */
 import "dotenv/config";
 import { runScrape } from "../../src/scraper";
+import { closeClient } from "../../src/db";
 
 async function main() {
-  await runScrape({ dryRun: false, headless: true });
+  try {
+    await runScrape({ dryRun: false, headless: true });
+    await closeClient();
+    process.exit(0);
+  } catch (err) {
+    await closeClient().catch(() => {});
+    throw err;
+  }
 }
 
 if (require.main === module) {
