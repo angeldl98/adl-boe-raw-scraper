@@ -18,7 +18,7 @@ export type ScrapeOptions = {
 };
 
 const DEFAULT_MAX_PAGES = Number.isFinite(Number(process.env.BOE_MAX_ITEMS))
-  ? Math.min(Math.max(Number(process.env.BOE_MAX_ITEMS), 1), 5)
+  ? Math.min(Math.max(Number(process.env.BOE_MAX_ITEMS), 3), 5)
   : 5;
 const MAX_PAGES_CAP = 5; // pauta fija: 3-5 páginas
 const MAX_DETAILS_DEFAULT = Number.isFinite(Number(process.env.BOE_MAX_DETAILS))
