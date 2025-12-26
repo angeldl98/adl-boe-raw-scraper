@@ -278,7 +278,7 @@ export async function runScrape(options: ScrapeOptions): Promise<void> {
       throw new Error("ZERO_LINKS_AFTER_SEARCH: do not retry, do not advance dates");
     }
 
-    const selected: ListingLink[] = listing.links.slice(0, maxPages);
+    const selected: ListingLink[] = listing.links.slice(-maxPages);
 
     for (let i = 0; i < selected.length; i++) {
       const link = selected[i];
