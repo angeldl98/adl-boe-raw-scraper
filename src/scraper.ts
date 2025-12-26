@@ -15,8 +15,8 @@ export type ScrapeOptions = {
 };
 
 const DEFAULT_MAX_PAGES = Number.isFinite(Number(process.env.BOE_MAX_ITEMS))
-  ? Math.min(Math.max(Number(process.env.BOE_MAX_ITEMS), 20), 100)
-  : 20;
+  ? Math.min(Math.max(Number(process.env.BOE_MAX_ITEMS), 50), 100)
+  : 50;
 
 function formatDateInput(date: Date): string {
   return date.toISOString().slice(0, 10);
