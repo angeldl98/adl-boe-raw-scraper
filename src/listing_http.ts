@@ -110,15 +110,15 @@ function applyDefaults(fields: FormField[]): FormField[] {
   for (const field of fields) {
     if (field.name === "dato[2]") {
       hasEstado = true;
-      // Si no hay estado elegido, forzamos "PU" (pendiente/abierta) para obtener resultados.
+      // Forzar estado activo (EJ = celebrándose)
       if (Array.isArray(field.value)) {
         const allEmpty = field.value.length === 0 || field.value.every((v) => !v);
         if (allEmpty) {
-          result.push({ name: field.name, value: "PU" });
+          result.push({ name: field.name, value: "EJ" });
           continue;
         }
       } else if (!field.value) {
-        result.push({ name: field.name, value: "PU" });
+        result.push({ name: field.name, value: "EJ" });
         continue;
       }
     }
@@ -126,7 +126,7 @@ function applyDefaults(fields: FormField[]): FormField[] {
   }
 
   if (!hasEstado) {
-    result.push({ name: "dato[2]", value: "PU" });
+    result.push({ name: "dato[2]", value: "EJ" });
   }
 
   return result;

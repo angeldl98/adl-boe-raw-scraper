@@ -2,6 +2,9 @@ import { chromium, Browser, Page, Locator } from "playwright";
 import { ListingLink } from "./listing_http";
 import { checksumSha256 } from "./checksum";
 import { persistRaw } from "./persist";
+import { getClient } from "./db";
+import fs from "fs";
+import path from "path";
 
 const BASE_URL = process.env.BOE_BASE_URL || "https://subastas.boe.es";
 const LISTING_URL = `${BASE_URL}/subastas_ava.php`;
@@ -15,8 +18,14 @@ export type ScrapeOptions = {
 };
 
 const DEFAULT_MAX_PAGES = Number.isFinite(Number(process.env.BOE_MAX_ITEMS))
-  ? Math.min(Math.max(Number(process.env.BOE_MAX_ITEMS), 50), 100)
-  : 50;
+  ? Math.min(Math.max(Number(process.env.BOE_MAX_ITEMS), 1), 5)
+  : 5;
+const MAX_DETAILS_DEFAULT = Number.isFinite(Number(process.env.BOE_MAX_DETAILS))
+  ? Math.min(Math.max(Number(process.env.BOE_MAX_DETAILS), 1), 30)
+  : 20;
+const DETAIL_DELAY_MS = 4000; // fijo, sin aleatoriedad
+const MAX_RUNTIME_MS = 8 * 60 * 1000; // 8 minutos de guardarraíl
+const MAX_REQUESTS = 1 + MAX_DETAILS_DEFAULT; // listado + detalles
 
 function formatDateInput(date: Date): string {
   return date.toISOString().slice(0, 10);
@@ -26,11 +35,6 @@ function addDays(date: Date, days: number): Date {
   const d = new Date(date);
   d.setDate(d.getDate() + days);
   return d;
-}
-
-function randomDelayMs() {
-  const seconds = 5 + Math.random() * 5; // 5-10s
-  return Math.floor(seconds * 1000);
 }
 
 async function safeWait(ms: number) {
@@ -98,8 +102,8 @@ async function acceptCookies(page: Page): Promise<boolean> {
   return false;
 }
 
-async function setEstadoPU(page: Page): Promise<void> {
-  const estadoRadio = page.locator("input[name='dato[2]'][value='PU']");
+async function setEstadoActivo(page: Page): Promise<void> {
+  const estadoRadio = page.locator("input[name='dato[2]'][value='EJ']");
   if (await estadoRadio.count()) {
     await estadoRadio.first().check({ force: true }).catch(() => {});
   }
@@ -121,7 +125,8 @@ async function setDateRange(page: Page, start: Date, end: Date): Promise<void> {
     const input = page.locator(sel);
     if (await input.count()) {
       await input.fill("");
-      await input.fill(sel.endsWith("[1]") ? endStr : startStr);
+      // Solo imponemos fecha_fin desde hoy; dejamos hasta sin fijar para excluir históricas y no limitar futuras.
+      await input.fill(sel.endsWith("[1]") ? "" : startStr);
     }
   }
 
@@ -214,13 +219,13 @@ async function ensureResults(page: Page): Promise<ListingLink[]> {
 type SubmitResult = { html: string; url: string; links: ListingLink[]; cookies: number; idBusqueda: string };
 
 async function submitSearch(page: Page): Promise<SubmitResult> {
-  const end = new Date();
-  const start = addDays(end, -365); // amplio rango fijo; sin reintentos
+  const end = addDays(new Date(), 30);
+  const start = new Date(); // activo: fecha_fin desde hoy
 
   await page.goto(LISTING_URL, { waitUntil: "domcontentloaded" });
   await acceptCookies(page).catch(() => {});
-  // Mantener estado por defecto (cualquiera) para maximizar resultados.
   await clearProvince(page);
+  await setEstadoActivo(page);
   await setDateRange(page, start, end);
 
   const searchClick =
@@ -237,6 +242,10 @@ async function submitSearch(page: Page): Promise<SubmitResult> {
   const links = await ensureResults(page);
 
   const html = await page.content();
+  const block = looksBlocked(html, page.url());
+  if (block) {
+    throw new Error(`LISTING_BLOCKED:${block}`);
+  }
   const url = page.url();
   const cookies = (await page.context().cookies()).length;
   const idBusqueda = await extractIdBusqueda(page);
@@ -257,15 +266,80 @@ async function fetchListingWithPlaywright(
   return listing;
 }
 
+function ensureDir(dir: string) {
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+}
+
+function deriveBoeUid(url: string, html: string): string | null {
+  const candidates = [url, html];
+  for (const src of candidates) {
+    const m = src.match(/(SUB-[A-Z0-9-]+)/i);
+    if (m?.[1]) return m[1];
+  }
+  return null;
+}
+
+function extractPdfLinks(html: string, pageUrl: string): string[] {
+  const regex = /href=["']([^"']+\.pdf[^"']*)["']/gi;
+  const results = new Set<string>();
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(html)) !== null) {
+    const href = match[1];
+    if (!href) continue;
+    const absolute = new URL(href, pageUrl).toString();
+    if (absolute.includes("Condiciones_procedimientos_enajenacion")) continue; // descartar PDF genérico
+    results.add(absolute);
+  }
+  return Array.from(results);
+}
+
+async function persistPdf(rawId: number, boeUid: string | null, pdfUrl: string, buffer: Buffer, checksum: string): Promise<void> {
+  const destDir = path.join("/opt/adl-suite/data/boe/pdfs", `raw-${rawId}`);
+  ensureDir(destDir);
+  const filePath = path.join(destDir, `${checksum}.pdf`);
+  fs.writeFileSync(filePath, buffer);
+  const client = await getClient();
+  await client.query(
+    `
+      INSERT INTO boe_subastas_pdfs (raw_id, boe_uid, pdf_type, file_path, checksum, fetched_at)
+      VALUES ($1,$2,$3,$4,$5, now())
+      ON CONFLICT (raw_id, checksum) DO NOTHING
+    `,
+    [rawId, boeUid, "pdf", filePath, checksum]
+  );
+}
+
+async function downloadFirstPdf(html: string, pageUrl: string, rawId: number): Promise<void> {
+  const links = extractPdfLinks(html, pageUrl);
+  if (!links.length) return;
+  const pdfUrl = links[0];
+  const res = await fetch(pdfUrl, { method: "GET" });
+  if (!res.ok) {
+    throw new Error(`PDF_DOWNLOAD_FAILED status=${res.status}`);
+  }
+  const arrayBuf = await res.arrayBuffer();
+  const buffer = Buffer.from(arrayBuf);
+  const checksum = checksumSha256(buffer.toString("binary"));
+  const boeUid = deriveBoeUid(pageUrl, html);
+  await persistPdf(rawId, boeUid, pdfUrl, buffer, checksum);
+  console.log(`[info] pdf_saved url=${pdfUrl} raw_id=${rawId} bytes=${buffer.length}`);
+}
+
 export async function runScrape(options: ScrapeOptions): Promise<void> {
-  const maxPages = options.maxPages ?? DEFAULT_MAX_PAGES;
+  const maxPages = Math.min(options.maxPages ?? DEFAULT_MAX_PAGES, MAX_DETAILS_DEFAULT);
+  const maxDetails = Math.min(MAX_DETAILS_DEFAULT, maxPages);
   const browser: Browser = await chromium.launch({ headless: options.headless, args: ["--no-sandbox"] });
   const context = await browser.newContext({ userAgent: USER_AGENT, viewport: { width: 1280, height: 800 } });
   const page = await context.newPage();
+  const startedAt = Date.now();
+  let requestCount = 0;
 
   try {
     console.log(`[info] Inicio: listado Playwright + detalles Playwright (max ${maxPages})`);
     const listing = await fetchListingWithPlaywright(page);
+    requestCount += 1;
     console.log(`[info] Listado obtenido desde ${listing.url}, html=${listing.html.length} chars`);
     console.log(`[info] Enlaces de detalle detectados: ${listing.links.length}`);
 
@@ -278,17 +352,28 @@ export async function runScrape(options: ScrapeOptions): Promise<void> {
       throw new Error("ZERO_LINKS_AFTER_SEARCH: do not retry, do not advance dates");
     }
 
-    const selected: ListingLink[] = listing.links.slice(-maxPages);
+    const selected: ListingLink[] = listing.links.slice(0, maxDetails);
 
     for (let i = 0; i < selected.length; i++) {
+      if (Date.now() - startedAt > MAX_RUNTIME_MS) {
+        throw new Error("MAX_RUNTIME_EXCEEDED");
+      }
+      if (requestCount >= MAX_REQUESTS) {
+        console.warn("[warn] MAX_REQUESTS reached, stopping further detail fetches");
+        break;
+      }
       const link = selected[i];
       console.log(`[info] Visitando detalle ${i + 1}/${selected.length}: ${link.absolute}`);
-      await safeWait(randomDelayMs());
+      await safeWait(DETAIL_DELAY_MS);
 
       await page.goto(link.absolute, { waitUntil: "domcontentloaded" });
       await page.waitForLoadState("networkidle");
 
       const html = await page.content();
+      const block = looksBlocked(html, page.url());
+      if (block) {
+        throw new Error(`DETAIL_BLOCKED:${block}`);
+      }
       if (looksLikeLanding(html)) {
         throw new Error(`DETAIL_VALIDATION_FAILED: landing detected ${link.absolute}`);
       }
@@ -298,9 +383,13 @@ export async function runScrape(options: ScrapeOptions): Promise<void> {
 
       if (!options.dryRun) {
         const checksum = checksumSha256(html);
-        await persistRaw({ url: page.url(), payload: html, checksum, source: "BOE_DETAIL" });
+        const rawId = await persistRaw({ url: page.url(), payload: html, checksum, source: "BOE_DETAIL" });
+        await downloadFirstPdf(html, page.url(), rawId).catch((err) => {
+          console.warn(`[warn] pdf_skip raw_id=${rawId} err=${err?.message || err}`);
+        });
         console.log(`[info] detail_ok url=${page.url()} bytes=${html.length}`);
       }
+      requestCount += 1;
     }
 
     console.log("[info] SUCCESS: inserted listing+detail");
