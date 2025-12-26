@@ -31,8 +31,12 @@ const MAX_RUNTIME_MS = 8 * 60 * 1000; // 8 minutos de guardarraíl
 const MAX_REQUESTS = 1 + 2 * MAX_DETAILS_CAP; // listado + detalle + lotes
 const LOT_DELAY_MS = 1000; // breve pausa antes de cargar lotes
 const PDF_DELAY_MS = 4000; // retraso fijo antes de descargar PDF
-const PDF_MAX_BYTES = 12 * 1024 * 1024; // 12MB límite duro
+const PDF_MAX_BYTES = 15 * 1024 * 1024; // 15MB límite duro
 const PDF_TIMEOUT_MS = 30_000; // 30s por PDF
+const STORAGE_STATE_PATH = process.env.BOE_STORAGE_STATE || "/opt/adl-suite/data/boe_auth/storageState.json";
+const STORAGE_STATE_DIR = path.dirname(STORAGE_STATE_PATH);
+const BOE_LOGIN_URL = process.env.BOE_LOGIN_URL || "https://subastas.boe.es/login.php";
+const BOE_PROXY = process.env.BOE_PROXY || "";
 
 function formatDateInput(date: Date): string {
   return date.toISOString().slice(0, 10);
@@ -322,6 +326,7 @@ async function persistPdf(rawId: number, boeUid: string | null, pdfUrl: string, 
 async function downloadFirstPdf(
   boeUid: string | null,
   rawId: number | null,
+  page: Page,
   links: string[]
 ): Promise<{ filePath: string; checksum: string } | null> {
   if (!boeUid) return null;
@@ -329,47 +334,36 @@ async function downloadFirstPdf(
   const pdfUrl = links[0];
   await safeWait(PDF_DELAY_MS);
 
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), PDF_TIMEOUT_MS);
-  try {
-    const res = await fetch(pdfUrl, { method: "GET", signal: controller.signal });
-    if (!res.ok) {
-      throw new Error(`PDF_DOWNLOAD_FAILED status=${res.status}`);
-    }
-    const ct = res.headers.get("content-type") || "";
-    if (!ct.toLowerCase().includes("application/pdf")) {
-      throw new Error(`PDF_NOT_PDF content_type=${ct}`);
-    }
-    const len = Number(res.headers.get("content-length") || "0");
-    if (len > PDF_MAX_BYTES) {
-      throw new Error(`PDF_TOO_LARGE content_length=${len}`);
-    }
-    const arrayBuf = await res.arrayBuffer();
-    const buffer = Buffer.from(arrayBuf);
-    if (buffer.byteLength > PDF_MAX_BYTES) {
-      throw new Error(`PDF_TOO_LARGE body_length=${buffer.byteLength}`);
-    }
-    const checksum = checksumSha256(buffer.toString("binary"));
-    const destDir = path.join("/opt/adl-suite/data/boe_pdfs", boeUid);
-    ensureDir(destDir);
-    const filePath = path.join(destDir, `${checksum}.pdf`);
-    fs.writeFileSync(filePath, buffer);
-    if (rawId !== null) {
-      const client = await getClient();
-      await client.query(
-        `
-          INSERT INTO boe_subastas_pdfs (raw_id, boe_uid, pdf_type, file_path, checksum, fetched_at)
-          VALUES ($1,$2,$3,$4,$5, now())
-          ON CONFLICT (raw_id, checksum) DO NOTHING
-        `,
-        [rawId, boeUid, "pdf", filePath, checksum]
-      );
-    }
-    console.log(`[info] pdf_saved url=${pdfUrl} boe_uid=${boeUid} bytes=${buffer.length}`);
-    return { filePath, checksum };
-  } finally {
-    clearTimeout(t);
+  const response = await page.goto(pdfUrl, { waitUntil: "networkidle", timeout: PDF_TIMEOUT_MS });
+  if (!response) throw new Error("PDF_ABORTED:no_response");
+  const status = response.status();
+  if (status >= 400) throw new Error(`PDF_ABORTED:http_${status}`);
+  const ct = (response.headers()["content-type"] || "").toLowerCase();
+  if (!ct.includes("application/pdf")) {
+    throw new Error(`PDF_ABORTED:not_pdf content_type=${ct}`);
   }
+  const len = Number(response.headers()["content-length"] || "0");
+  if (len > PDF_MAX_BYTES) throw new Error(`PDF_ABORTED:too_large content_length=${len}`);
+  const buffer = Buffer.from(await response.body());
+  if (buffer.byteLength > PDF_MAX_BYTES) throw new Error(`PDF_ABORTED:too_large body_length=${buffer.byteLength}`);
+  const checksum = checksumSha256(buffer.toString("binary"));
+  const destDir = path.join("/opt/adl-suite/data/boe_pdfs", boeUid);
+  ensureDir(destDir);
+  const filePath = path.join(destDir, `${checksum}.pdf`);
+  fs.writeFileSync(filePath, buffer);
+  if (rawId !== null) {
+    const client = await getClient();
+    await client.query(
+      `
+        INSERT INTO boe_subastas_pdfs (raw_id, boe_uid, pdf_type, file_path, checksum, fetched_at)
+        VALUES ($1,$2,$3,$4,$5, now())
+        ON CONFLICT (raw_id, checksum) DO NOTHING
+      `,
+      [rawId, boeUid, "pdf", filePath, checksum]
+    );
+  }
+  console.log(`[info] PDF_SAVED boe_uid=${boeUid} url=${pdfUrl} bytes=${buffer.length} checksum=${checksum}`);
+  return { filePath, checksum };
 }
 
 function parseEuroToNumber(val: string | null | undefined): number | null {
@@ -403,9 +397,25 @@ export async function runScrape(options: ScrapeOptions): Promise<void> {
   const maxPagesRequested = options.maxPages ?? DEFAULT_MAX_PAGES;
   const maxPages = Math.min(maxPagesRequested, MAX_PAGES_CAP);
   const maxDetails = Math.min(MAX_DETAILS_DEFAULT, MAX_DETAILS_CAP, maxPages * 5); // tope fijo de detalles
-  const browser: Browser = await chromium.launch({ headless: options.headless, args: ["--no-sandbox"] });
-  const context = await browser.newContext({ userAgent: USER_AGENT, viewport: { width: 1280, height: 800 } });
+  ensureDir(STORAGE_STATE_DIR);
+  const launchArgs = ["--no-sandbox"];
+  if (BOE_PROXY) {
+    launchArgs.push(`--proxy-server=${BOE_PROXY}`);
+  }
+  const browser: Browser = await chromium.launch({ headless: options.headless, args: launchArgs });
+  const context = await browser.newContext({
+    userAgent: USER_AGENT,
+    viewport: { width: 1280, height: 800 },
+    storageState: fs.existsSync(STORAGE_STATE_PATH) ? STORAGE_STATE_PATH : undefined
+  });
   const page = await context.newPage();
+  const sessionLoaded = fs.existsSync(STORAGE_STATE_PATH);
+  console.log(`[info] ${sessionLoaded ? "AUTH_SESSION_LOADED" : "AUTH_SESSION_MISSING"} storage=${STORAGE_STATE_PATH}`);
+  if (!sessionLoaded) {
+    console.error("AUTH_SESSION_INVALID: storageState missing. Please login manually and save storageState.");
+    await browser.close();
+    throw new Error("AUTH_SESSION_INVALID");
+  }
   const startedAt = Date.now();
   let requestCount = 0;
 
@@ -481,9 +491,14 @@ export async function runScrape(options: ScrapeOptions): Promise<void> {
 
         const rawId = await persistRaw({ url: page.url(), payload: augmentedHtml, checksum, source: "BOE_DETAIL" });
         const boeUid = deriveBoeUid(page.url(), augmentedHtml);
-        await downloadFirstPdf(boeUid, rawId, pdfLinks).catch((err) => {
-          console.warn(`[warn] pdf_skip raw_id=${rawId} err=${err?.message || err}`);
-        });
+        if (pdfLinks.length) {
+          try {
+            await downloadFirstPdf(boeUid, rawId, page, pdfLinks);
+          } catch (err: any) {
+            console.error(`[warn] PDF_ABORTED raw_id=${rawId} reason=${err?.message || err}`);
+            throw err;
+          }
+        }
         console.log(
           `[info] detail_ok url=${page.url()} bytes=${detailHtml.length} lot_sum=${lotSum !== null ? lotSum.toFixed(2) : "null"}`
         );
