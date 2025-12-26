@@ -9,8 +9,9 @@ import { closeClient } from "../../src/db";
 
 async function main() {
   try {
-    const maxPagesEnv = Number(process.env.BOE_MAX_ITEMS || process.env.BOE_MAX_PAGES || "50");
-    const maxPages = Number.isFinite(maxPagesEnv) && maxPagesEnv > 0 ? Math.min(Math.max(Math.floor(maxPagesEnv), 50), 100) : 50;
+    const maxPagesEnv = Number(process.env.BOE_MAX_ITEMS || process.env.BOE_MAX_PAGES || "5");
+    const maxPages =
+      Number.isFinite(maxPagesEnv) && maxPagesEnv > 0 ? Math.min(Math.max(Math.floor(maxPagesEnv), 1), 5) : 5;
     await runScrape({ dryRun: false, headless: true, maxPages });
     await closeClient();
     process.exit(0);

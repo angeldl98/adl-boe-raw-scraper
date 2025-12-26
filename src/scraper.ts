@@ -20,12 +20,14 @@ export type ScrapeOptions = {
 const DEFAULT_MAX_PAGES = Number.isFinite(Number(process.env.BOE_MAX_ITEMS))
   ? Math.min(Math.max(Number(process.env.BOE_MAX_ITEMS), 1), 5)
   : 5;
+const MAX_PAGES_CAP = 5; // pauta fija: 3-5 páginas
 const MAX_DETAILS_DEFAULT = Number.isFinite(Number(process.env.BOE_MAX_DETAILS))
-  ? Math.min(Math.max(Number(process.env.BOE_MAX_DETAILS), 1), 30)
+  ? Math.min(Math.max(Number(process.env.BOE_MAX_DETAILS), 1), 25)
   : 20;
+const MAX_DETAILS_CAP = 25;
 const DETAIL_DELAY_MS = 4000; // fijo, sin aleatoriedad
 const MAX_RUNTIME_MS = 8 * 60 * 1000; // 8 minutos de guardarraíl
-const MAX_REQUESTS = 1 + MAX_DETAILS_DEFAULT; // listado + detalles
+const MAX_REQUESTS = 1 + MAX_DETAILS_CAP; // listado + detalles
 
 function formatDateInput(date: Date): string {
   return date.toISOString().slice(0, 10);
@@ -125,8 +127,8 @@ async function setDateRange(page: Page, start: Date, end: Date): Promise<void> {
     const input = page.locator(sel);
     if (await input.count()) {
       await input.fill("");
-      // Solo imponemos fecha_fin desde hoy; dejamos hasta sin fijar para excluir históricas y no limitar futuras.
-      await input.fill(sel.endsWith("[1]") ? "" : startStr);
+      // Ventana explícita: fecha_fin >= hoy y hasta end (p.ej. +30d)
+      await input.fill(sel.endsWith("[1]") ? endStr : startStr);
     }
   }
 
@@ -328,8 +330,9 @@ async function downloadFirstPdf(html: string, pageUrl: string, rawId: number): P
 }
 
 export async function runScrape(options: ScrapeOptions): Promise<void> {
-  const maxPages = Math.min(options.maxPages ?? DEFAULT_MAX_PAGES, MAX_DETAILS_DEFAULT);
-  const maxDetails = Math.min(MAX_DETAILS_DEFAULT, maxPages);
+  const maxPagesRequested = options.maxPages ?? DEFAULT_MAX_PAGES;
+  const maxPages = Math.min(maxPagesRequested, MAX_PAGES_CAP);
+  const maxDetails = Math.min(MAX_DETAILS_DEFAULT, MAX_DETAILS_CAP, maxPages * 5); // tope fijo de detalles
   const browser: Browser = await chromium.launch({ headless: options.headless, args: ["--no-sandbox"] });
   const context = await browser.newContext({ userAgent: USER_AGENT, viewport: { width: 1280, height: 800 } });
   const page = await context.newPage();
