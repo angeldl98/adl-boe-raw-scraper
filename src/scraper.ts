@@ -6,6 +6,8 @@ import { getClient } from "./db";
 import fs from "fs";
 import path from "path";
 import { URL } from "url";
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const pdfParse = require("pdf-parse");
 
 const BASE_URL = process.env.BOE_BASE_URL || "https://subastas.boe.es";
 const LISTING_URL = `${BASE_URL}/subastas_ava.php`;
@@ -30,13 +32,25 @@ const DETAIL_DELAY_MS = 4000; // fijo, sin aleatoriedad
 const MAX_RUNTIME_MS = 8 * 60 * 1000; // 8 minutos de guardarraíl
 const MAX_REQUESTS = 1 + 2 * MAX_DETAILS_CAP; // listado + detalle + lotes
 const LOT_DELAY_MS = 1000; // breve pausa antes de cargar lotes
-const PDF_DELAY_MS = 4000; // retraso fijo antes de descargar PDF
+const PDF_DELAY_MIN_MS = Number(process.env.BOE_PDF_DELAY_MIN_MS || 3000);
+const PDF_DELAY_MAX_MS = Number(process.env.BOE_PDF_DELAY_MAX_MS || 6000);
 const PDF_MAX_BYTES = 15 * 1024 * 1024; // 15MB límite duro
 const PDF_TIMEOUT_MS = 30_000; // 30s por PDF
 const STORAGE_STATE_PATH = process.env.BOE_STORAGE_STATE || "/opt/adl-suite/data/boe_auth/storageState.json";
 const STORAGE_STATE_DIR = path.dirname(STORAGE_STATE_PATH);
 const BOE_LOGIN_URL = process.env.BOE_LOGIN_URL || "https://subastas.boe.es/login.php";
 const BOE_PROXY = process.env.BOE_PROXY || "";
+
+const PDF_BUDGET = Number.isFinite(Number(process.env.BOE_PDF_DAILY_BUDGET))
+  ? Math.max(Number(process.env.BOE_PDF_DAILY_BUDGET), 0)
+  : 20;
+const PDF_MAX_DAYS_AHEAD = Number.isFinite(Number(process.env.BOE_PDF_MAX_DAYS_AHEAD))
+  ? Math.max(Number(process.env.BOE_PDF_MAX_DAYS_AHEAD), 1)
+  : 45;
+const PDF_ONLY_ACTIVE = (process.env.BOE_PDF_ONLY_ACTIVE || "true").toLowerCase() === "true";
+const PDF_ONLY_INMUEBLE = (process.env.BOE_PDF_ONLY_INMUEBLE || "true").toLowerCase() === "true";
+const PDF_DRY_RUN = (process.env.BOE_PDF_DRY_RUN || "false").toLowerCase() === "true";
+const QUEUE_LIMIT = 200;
 
 function formatDateInput(date: Date): string {
   return date.toISOString().slice(0, 10);
@@ -50,6 +64,11 @@ function addDays(date: Date, days: number): Date {
 
 async function safeWait(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function randomDelay(minMs: number, maxMs: number): number {
+  const delta = Math.max(maxMs - minMs, 0);
+  return minMs + Math.floor(Math.random() * (delta + 1));
 }
 
 function looksBlocked(html: string, url: string): string | null {
@@ -230,7 +249,7 @@ async function ensureResults(page: Page): Promise<ListingLink[]> {
 type SubmitResult = { html: string; url: string; links: ListingLink[]; cookies: number; idBusqueda: string };
 
 async function submitSearch(page: Page): Promise<SubmitResult> {
-  const end = addDays(new Date(), 30);
+  const end = addDays(new Date(), PDF_MAX_DAYS_AHEAD);
   const start = new Date(); // activo: fecha_fin desde hoy
 
   await page.goto(LISTING_URL, { waitUntil: "domcontentloaded" });
@@ -323,16 +342,35 @@ async function persistPdf(rawId: number, boeUid: string | null, pdfUrl: string, 
   );
 }
 
+async function ensurePdfSignalsTable() {
+  const client = await getClient();
+  await client.query(`
+    CREATE SCHEMA IF NOT EXISTS boe_aux;
+    CREATE TABLE IF NOT EXISTS boe_aux.pdf_signals (
+      subasta_id INT PRIMARY KEY,
+      boe_uid TEXT,
+      has_cargas_mencionadas BOOLEAN,
+      procedimiento TEXT,
+      juzgado TEXT,
+      extract_ok BOOLEAN,
+      extract_reason TEXT,
+      extracted_at TIMESTAMPTZ DEFAULT now(),
+      file_path TEXT,
+      checksum TEXT
+    );
+  `);
+}
+
 async function downloadFirstPdf(
   boeUid: string | null,
   rawId: number | null,
   page: Page,
   links: string[]
-): Promise<{ filePath: string; checksum: string } | null> {
+): Promise<{ filePath: string; checksum: string; buffer: Buffer } | null> {
   if (!boeUid) return null;
   if (!links.length) return null;
   const pdfUrl = links[0];
-  await safeWait(PDF_DELAY_MS);
+  await safeWait(randomDelay(PDF_DELAY_MIN_MS, PDF_DELAY_MAX_MS));
 
   const response = await page.goto(pdfUrl, { waitUntil: "networkidle", timeout: PDF_TIMEOUT_MS });
   if (!response) throw new Error("PDF_ABORTED:no_response");
@@ -363,7 +401,7 @@ async function downloadFirstPdf(
     );
   }
   console.log(`[info] PDF_SAVED boe_uid=${boeUid} url=${pdfUrl} bytes=${buffer.length} checksum=${checksum}`);
-  return { filePath, checksum };
+  return { filePath, checksum, buffer };
 }
 
 function parseEuroToNumber(val: string | null | undefined): number | null {
@@ -371,6 +409,37 @@ function parseEuroToNumber(val: string | null | undefined): number | null {
   const cleaned = val.replace(/[^\d.,]/g, "").replace(/\.(?=\d{3}\b)/g, "").replace(",", ".");
   const num = Number(cleaned);
   return Number.isFinite(num) ? num : null;
+}
+
+function parseDateFromDetail(html: string): Date | null {
+  const m = html.match(/Fecha[^<]{0,40}fin[^<]{0,20}:\s*<\/td>\s*<td[^>]*>\s*([0-9]{2}\/[0-9]{2}\/[0-9]{4})/i);
+  if (!m) return null;
+  const [d, mo, y] = m[1].split("/").map(Number);
+  const dt = new Date(Number(y), Number(mo) - 1, Number(d));
+  return Number.isNaN(dt.getTime()) ? null : dt;
+}
+
+function extractTipoBien(html: string): string | null {
+  const m = html.match(/Tipo\s+de\s+bien<\/th>\s*<td[^>]*>\s*([^<]+)/i);
+  if (m?.[1]) return m[1].trim();
+  const m2 = html.match(/Tipo\s+de\s+Subasta<\/th>\s*<td[^>]*>\s*([^<]+)/i);
+  if (m2?.[1]) return m2[1].trim();
+  return null;
+}
+
+function isInmuebleHeuristic(tipo: string | null, html: string): boolean {
+  const txt = ((tipo || "") + " " + html).toLowerCase();
+  return (
+    txt.includes("inmueble") ||
+    txt.includes("vivienda") ||
+    txt.includes("piso") ||
+    txt.includes("garaje") ||
+    txt.includes("trastero") ||
+    txt.includes("local") ||
+    txt.includes("urbano") ||
+    txt.includes("rustico") ||
+    txt.includes("suelo")
+  );
 }
 
 function extractLotValues(html: string): number[] {
@@ -382,6 +451,53 @@ function extractLotValues(html: string): number[] {
     if (val !== null) values.push(val);
   }
   return values;
+}
+
+function extractSignalsFromText(text: string): { hasCargas: boolean; procedimiento: string | null; juzgado: string | null } {
+  const lower = text.toLowerCase();
+  const hasCargas =
+    lower.includes("carga") ||
+    lower.includes("hipoteca") ||
+    lower.includes("embargo") ||
+    lower.includes("gravamen") ||
+    lower.includes("preferente");
+  const procMatch = text.match(/(ejecuci[oó]n hipotecaria|ejecuci[oó]n|procedimiento [a-zA-Z ]{3,30})/i);
+  const juzMatch = text.match(/Juzgado[^,\n]{0,60}/i);
+  return {
+    hasCargas,
+    procedimiento: procMatch ? procMatch[1] : null,
+    juzgado: juzMatch ? juzMatch[0] : null
+  };
+}
+
+async function persistPdfSignals(
+  subastaId: number | null,
+  boeUid: string | null,
+  filePath: string,
+  checksum: string,
+  signals: { hasCargas: boolean; procedimiento: string | null; juzgado: string | null; ok: boolean; reason?: string }
+) {
+  if (subastaId === null) return;
+  const client = await getClient();
+  await ensurePdfSignalsTable();
+  await client.query(
+    `
+      INSERT INTO boe_aux.pdf_signals
+        (subasta_id, boe_uid, has_cargas_mencionadas, procedimiento, juzgado, extract_ok, extract_reason, file_path, checksum, extracted_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, now())
+      ON CONFLICT (subasta_id) DO UPDATE SET
+        boe_uid = EXCLUDED.boe_uid,
+        has_cargas_mencionadas = EXCLUDED.has_cargas_mencionadas,
+        procedimiento = EXCLUDED.procedimiento,
+        juzgado = EXCLUDED.juzgado,
+        extract_ok = EXCLUDED.extract_ok,
+        extract_reason = EXCLUDED.extract_reason,
+        file_path = EXCLUDED.file_path,
+        checksum = EXCLUDED.checksum,
+        extracted_at = now()
+    `,
+    [subastaId, boeUid, signals.hasCargas, signals.procedimiento, signals.juzgado, signals.ok, signals.reason || null, filePath, checksum]
+  );
 }
 
 function buildLotUrl(detailUrl: string, idBus?: string | null): string {
@@ -437,6 +553,16 @@ export async function runScrape(options: ScrapeOptions): Promise<void> {
     }
 
     const selected: ListingLink[] = listing.links.slice(0, maxDetails);
+    const detailRecords: Array<{
+      link: ListingLink;
+      rawId: number;
+      boeUid: string | null;
+      pdfLinks: string[];
+      lotSum: number | null;
+      fechaFin: Date | null;
+      tipo: string | null;
+      subastaId: number | null;
+    }> = [];
 
     for (let i = 0; i < selected.length; i++) {
       if (Date.now() - startedAt > MAX_RUNTIME_MS) {
@@ -465,48 +591,128 @@ export async function runScrape(options: ScrapeOptions): Promise<void> {
         throw new Error(`DETAIL_VALIDATION_FAILED: missing detail markers ${link.absolute}`);
       }
 
-      if (!options.dryRun) {
-        // Lotes: obtener valor_subasta desde ver=3
-        const lotUrl = buildLotUrl(page.url(), idBusListado);
-        await safeWait(LOT_DELAY_MS);
-        await page.goto(lotUrl, { waitUntil: "domcontentloaded" });
-        await page.waitForLoadState("networkidle");
-        const lotHtml = await page.content();
-        const lotVals = extractLotValues(lotHtml);
-        const lotSum = lotVals.length ? lotVals.reduce((a, b) => a + b, 0) : null;
-        const pdfLinks = [...extractPdfLinks(html, page.url()), ...extractPdfLinks(lotHtml, lotUrl)];
+      // Lotes: obtener valor_subasta desde ver=3
+      const lotUrl = buildLotUrl(page.url(), idBusListado);
+      await safeWait(LOT_DELAY_MS);
+      await page.goto(lotUrl, { waitUntil: "domcontentloaded" });
+      await page.waitForLoadState("networkidle");
+      const lotHtml = await page.content();
+      const lotVals = extractLotValues(lotHtml);
+      const lotSum = lotVals.length ? lotVals.reduce((a, b) => a + b, 0) : null;
+      const pdfLinks = [...extractPdfLinks(html, page.url()), ...extractPdfLinks(lotHtml, lotUrl)];
 
-        // Volver a detalle para persistir el HTML enriquecido (opcional para coherencia visual)
-        await page.goto(link.absolute, { waitUntil: "domcontentloaded" });
-        await page.waitForLoadState("networkidle");
-        const detailHtml = await page.content();
+      // Volver a detalle para persistir el HTML enriquecido (opcional para coherencia visual)
+      await page.goto(link.absolute, { waitUntil: "domcontentloaded" });
+      await page.waitForLoadState("networkidle");
+      const detailHtml = await page.content();
 
-        const checksum = checksumSha256(detailHtml);
-        const augmentedHtml =
-          lotSum !== null
-            ? `${detailHtml}\n<!-- lot_valor_subasta_sum=${lotSum.toFixed(2)} -->\n<div>Valor subasta (lotes): ${lotSum.toFixed(
-                2
-              )} €</div>\n`
-            : detailHtml;
+      const checksum = checksumSha256(detailHtml);
+      const augmentedHtml =
+        lotSum !== null
+          ? `${detailHtml}\n<!-- lot_valor_subasta_sum=${lotSum.toFixed(2)} -->\n<div>Valor subasta (lotes): ${lotSum.toFixed(
+              2
+            )} €</div>\n`
+          : detailHtml;
 
-        const rawId = await persistRaw({ url: page.url(), payload: augmentedHtml, checksum, source: "BOE_DETAIL" });
-        const boeUid = deriveBoeUid(page.url(), augmentedHtml);
-        if (pdfLinks.length) {
-          try {
-            await downloadFirstPdf(boeUid, rawId, page, pdfLinks);
-          } catch (err: any) {
-            console.error(`[warn] PDF_ABORTED raw_id=${rawId} reason=${err?.message || err}`);
-            throw err;
-          }
-        }
-        console.log(
-          `[info] detail_ok url=${page.url()} bytes=${detailHtml.length} lot_sum=${lotSum !== null ? lotSum.toFixed(2) : "null"}`
-        );
-      }
+      const rawId = options.dryRun ? -1 : await persistRaw({ url: page.url(), payload: augmentedHtml, checksum, source: "BOE_DETAIL" });
+      const boeUid = deriveBoeUid(page.url(), augmentedHtml);
+      const fechaFin = parseDateFromDetail(augmentedHtml);
+      const tipo = extractTipoBien(augmentedHtml);
+      const subastaId = parseInt(new URL(page.url()).searchParams.get("idSub") || "", 10);
+      detailRecords.push({
+        link,
+        rawId,
+        boeUid,
+        pdfLinks,
+        lotSum,
+        fechaFin,
+        tipo,
+        subastaId: Number.isFinite(subastaId) ? subastaId : null
+      });
+      console.log(
+        `[info] detail_ok url=${page.url()} bytes=${detailHtml.length} lot_sum=${lotSum !== null ? lotSum.toFixed(2) : "null"}`
+      );
+
       requestCount += 1;
     }
 
-    console.log("[info] SUCCESS: inserted listing+detail");
+    // Cola priorizada de PDFs
+    const nowDate = new Date();
+    const windowEnd = addDays(nowDate, PDF_MAX_DAYS_AHEAD);
+    const queue = detailRecords
+      .filter((d) => {
+        if (!d.pdfLinks.length) return false;
+        if (PDF_ONLY_INMUEBLE && !isInmuebleHeuristic(d.tipo, "")) return false;
+        if (d.fechaFin && d.fechaFin > windowEnd) return false;
+        return true;
+      })
+      .slice(0, QUEUE_LIMIT)
+      .sort((a, b) => {
+        const da = a.fechaFin ? a.fechaFin.getTime() : Number.MAX_SAFE_INTEGER;
+        const db = b.fechaFin ? b.fechaFin.getTime() : Number.MAX_SAFE_INTEGER;
+        if (da !== db) return da - db;
+        const va = a.lotSum || 0;
+        const vb = b.lotSum || 0;
+        return vb - va;
+      });
+
+    console.log(
+      `QUEUE | listed_total=${selected.length} | eligible=${queue.length} | queued=${queue.length} | window_days=${PDF_MAX_DAYS_AHEAD}`
+    );
+
+    let budget = PDF_BUDGET;
+    let pdfDownloaded = 0;
+    let pdfFailed = 0;
+    let pdfSkipped = 0;
+
+    for (const item of queue) {
+      if (budget <= 0) break;
+      if (!item.boeUid || !item.pdfLinks.length) {
+        pdfSkipped += 1;
+        continue;
+      }
+      if (PDF_DRY_RUN) {
+        console.log(`PDF_WOULD_DOWNLOAD boe_uid=${item.boeUid} subasta_id=${item.subastaId || "null"} url=${item.pdfLinks[0]}`);
+        budget -= 1;
+        pdfSkipped += 1;
+        continue;
+      }
+      await safeWait(randomDelay(PDF_DELAY_MIN_MS, PDF_DELAY_MAX_MS));
+      try {
+        const downloaded = await downloadFirstPdf(item.boeUid, item.rawId, page, item.pdfLinks);
+        if (downloaded) {
+          pdfDownloaded += 1;
+          budget -= 1;
+          const text = await pdfParse(downloaded.buffer).then((r: any) => r.text as string).catch(() => "");
+          const signals = extractSignalsFromText(text || "");
+          await persistPdfSignals(item.subastaId, item.boeUid, downloaded.filePath, downloaded.checksum, {
+            hasCargas: signals.hasCargas,
+            procedimiento: signals.procedimiento,
+            juzgado: signals.juzgado,
+            ok: true
+          });
+        } else {
+          pdfSkipped += 1;
+        }
+      } catch (err: any) {
+        pdfFailed += 1;
+        budget -= 1;
+        console.error(`[warn] PDF_FAIL boe_uid=${item.boeUid} reason=${err?.message || err}`);
+        if (item.subastaId) {
+          await persistPdfSignals(item.subastaId, item.boeUid, "", "", {
+            hasCargas: false,
+            procedimiento: null,
+            juzgado: null,
+            ok: false,
+            reason: err?.message || "pdf_fail"
+          });
+        }
+      }
+    }
+
+    console.log(
+      `RUN_OK | listed=${listing.links.length} | eligible=${queue.length} | queued=${queue.length} | pdf_downloaded=${pdfDownloaded} | pdf_failed=${pdfFailed} | pdf_skipped=${pdfSkipped} | dry_run=${PDF_DRY_RUN}`
+    );
   } finally {
     await browser.close();
   }

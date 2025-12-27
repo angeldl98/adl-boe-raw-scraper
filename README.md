@@ -34,3 +34,12 @@ Config:
 - Uses standard PG envs or DATABASE_URL as per `src/db.ts`.
 
 Next (automation) is not enabled yet; see `systemd/` templates for future use.
+
+PDF policy (prioridad/seguridad):
+- BOE_PDF_DAILY_BUDGET (default 20): cupo de PDFs por ejecución.
+- BOE_PDF_MAX_DAYS_AHEAD (default 45): ventana máxima de fecha_fin.
+- BOE_PDF_ONLY_ACTIVE (default true): solo subastas activas (buscador ya filtra EJ).
+- BOE_PDF_ONLY_INMUEBLE (default true): heurística tipo inmueble.
+- BOE_PDF_DRY_RUN (default false): simula descargas.
+- BOE_PDF_DELAY_MIN_MS / BOE_PDF_DELAY_MAX_MS: delays humanos (default 3000/6000 ms).
+- Cola priorizada: fecha_fin asc, valor_tasacion (lotes) desc; máximo 200 en cola.
