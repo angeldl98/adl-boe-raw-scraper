@@ -26,9 +26,10 @@ import "dotenv/config";
 import { runScrape } from "../../src/scraper";
 
 const DRY_RUN = process.env.DRY_RUN === "true";
+const HEADLESS = process.env.HEADLESS !== "false";
 
 async function runManual(): Promise<void> {
-  await runScrape({ dryRun: DRY_RUN, headless: false });
+  await runScrape({ dryRun: DRY_RUN, headless: HEADLESS });
 }
 
 // Entry point for manual invocation only. Do NOT automate.
