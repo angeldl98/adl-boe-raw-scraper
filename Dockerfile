@@ -1,14 +1,11 @@
-FROM node:20-slim AS deps
+FROM mcr.microsoft.com/playwright:v1.41.2-jammy
+
 WORKDIR /app
 COPY package*.json ./
 RUN npm ci
-
-FROM node:20-slim AS runner
-WORKDIR /app
-ENV NODE_ENV=production
-COPY --from=deps /app/node_modules ./node_modules
 COPY . .
-RUN chmod +x runner.sh
-CMD ["./runner.sh"]
+
+ENV PLAYWRIGHT_BROWSERS_PATH=0
+CMD ["npm","start"]
 
 
