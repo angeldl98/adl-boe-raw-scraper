@@ -938,10 +938,20 @@ export async function runScrape(options: ScrapeOptions): Promise<void> {
     console.log(
       `RUN_OK | listed=${candidatePool.size} | eligible=${queue.length} | queued=${queue.length} | pdf_downloaded=${pdfDownloaded} | pdf_failed=${pdfFailed} | pdf_skipped=${pdfSkipped} | dry_run=${PDF_DRY_RUN}`
     );
-    await runClient.query(
-      `UPDATE pipeline_runs SET status='ok', finished_at=now(), stats=$2 WHERE id=$1`,
-      [runId, JSON.stringify(runStats)]
-    );
+    const allValidated = (runStats.validated as number) > 0;
+    const hadCandidates = (runStats.candidate_count_total as number) > 0;
+    if (!allValidated && hadCandidates) {
+      runStats.mode = "degraded";
+      await runClient.query(
+        `UPDATE pipeline_runs SET status='degraded', finished_at=now(), stats=$2 WHERE id=$1`,
+        [runId, JSON.stringify(runStats)]
+      );
+    } else {
+      await runClient.query(
+        `UPDATE pipeline_runs SET status='ok', finished_at=now(), stats=$2 WHERE id=$1`,
+        [runId, JSON.stringify(runStats)]
+      );
+    }
   } catch (err: any) {
     await runClient.query(
       `UPDATE pipeline_runs SET status='error', finished_at=now(), stats=$3, error=$2 WHERE id=$1`,
