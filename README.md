@@ -43,3 +43,25 @@ PDF policy (prioridad/seguridad):
 - BOE_PDF_DRY_RUN (default false): simula descargas.
 - BOE_PDF_DELAY_MIN_MS / BOE_PDF_DELAY_MAX_MS: delays humanos (default 3000/6000 ms).
 - Cola priorizada: fecha_fin asc, valor_tasacion (lotes) desc; máximo 200 en cola.
+
+## Session Management
+
+BOE session cookies are stored in `/opt/adl-suite/data/boe_auth/storageState.json`.
+
+### When Cookies Expire
+
+Symptoms:
+- Scraper logs show authentication errors
+- Degraded mode triggered frequently
+- "Login required" messages in evidence
+
+### Renew Session
+
+```bash
+cd /opt/adl-suite/adl-boe-raw-scraper
+npm run renew-session
+```
+
+Follow on-screen instructions. See `scripts/README.md` for details.
+
+**Important**: Session renewal is manual only. Do NOT automate.
