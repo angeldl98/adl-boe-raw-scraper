@@ -1,11 +1,14 @@
-FROM node:20-slim
-
+FROM node:20-slim AS deps
 WORKDIR /app
-
-# Runtime-only image: assumes dist has been built outside the container.
-COPY dist ./dist
 COPY package*.json ./
+RUN npm ci
 
-CMD ["node", "dist/main.js"]
+FROM node:20-slim AS runner
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+RUN chmod +x runner.sh
+CMD ["./runner.sh"]
 
 
