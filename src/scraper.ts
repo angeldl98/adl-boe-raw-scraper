@@ -9,6 +9,8 @@ import { URL } from "url";
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const pdfParse = require("pdf-parse");
 
+const DISABLE_PDF_PARSE = process.env.DISABLE_PDF_PARSE === "true";
+
 const BASE_URL = process.env.BOE_BASE_URL || "https://subastas.boe.es";
 const LISTING_URL = `${BASE_URL}/subastas_ava.php`;
 const USER_AGENT =
@@ -683,7 +685,10 @@ export async function runScrape(options: ScrapeOptions): Promise<void> {
         if (downloaded) {
           pdfDownloaded += 1;
           budget -= 1;
-          const text = await pdfParse(downloaded.buffer).then((r: any) => r.text as string).catch(() => "");
+          // PDF parsing disabled at raw stage to avoid DOM dependency. Parsing will be handled by normalizer/analyst.
+          const text = DISABLE_PDF_PARSE
+            ? ""
+            : await pdfParse(downloaded.buffer).then((r: any) => r.text as string).catch(() => "");
           const signals = extractSignalsFromText(text || "");
           await persistPdfSignals(item.subastaId, item.boeUid, downloaded.filePath, downloaded.checksum, {
             hasCargas: signals.hasCargas,
