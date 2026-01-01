@@ -686,9 +686,7 @@ export async function runScrape(options: ScrapeOptions): Promise<void> {
           pdfDownloaded += 1;
           budget -= 1;
           // PDF parsing disabled at raw stage to avoid DOM dependency. Parsing will be handled by normalizer/analyst.
-          const text = DISABLE_PDF_PARSE
-            ? ""
-            : await pdfParse(downloaded.buffer).then((r: any) => r.text as string).catch(() => "");
+          const text = "";
           const signals = extractSignalsFromText(text || "");
           await persistPdfSignals(item.subastaId, item.boeUid, downloaded.filePath, downloaded.checksum, {
             hasCargas: signals.hasCargas,
