@@ -13,6 +13,8 @@
 
 ## Trazabilidad en pipeline_runs.stats
 - Campos agregados: `found_dom`, `found_xhr`, `found_inferred`, `validated`, `discarded`, `mode`, `evidence_html`, `evidence_screenshot`, `dom_fingerprint`.
+- `dom_fingerprint` se calcula con utilidad compartida (HTML normalizado → SHA-256).
+- `candidate_count_total` refleja el tamaño final del pool deduplicado (informativo).
 
 ## Ejecución única
 - Camino único: A → B → C → pool → validación → persistencia. Si el pool queda vacío, se degrada sin error y sin escribir datos.

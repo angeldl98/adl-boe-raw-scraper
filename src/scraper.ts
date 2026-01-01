@@ -1,6 +1,6 @@
 import { chromium, Browser, Page, Locator } from "playwright";
 import { ListingLink } from "./listing_http";
-import { checksumSha256 } from "./checksum";
+import { checksumSha256, domFingerprint } from "./checksum";
 import { persistRaw } from "./persist";
 import { getClient, closeClient } from "./db";
 import fs from "fs";
@@ -363,11 +363,6 @@ function extractIdSub(urlStr: string): string | null {
   }
 }
 
-function domFingerprint(html: string): string {
-  const normalized = html.replace(/\s+/g, " ").trim();
-  return checksumSha256(normalized);
-}
-
 async function collectNetworkCandidates(page: Page): Promise<Set<string>> {
   const urls = new Set<string>();
   page.on("response", (resp) => {
@@ -706,7 +701,8 @@ export async function runScrape(options: ScrapeOptions): Promise<void> {
     mode: "normal",
     evidence_html: "",
     evidence_screenshot: "",
-    dom_fingerprint: ""
+    dom_fingerprint: "",
+    candidate_count_total: 0
   };
 
   try {
@@ -739,6 +735,7 @@ export async function runScrape(options: ScrapeOptions): Promise<void> {
     listing.links.forEach((l) => pushCandidate(l.absolute, "dom"));
     xhrCandidates.forEach((u) => pushCandidate(u, "xhr"));
     inferred.forEach((u) => pushCandidate(u, "inferred"));
+    runStats.candidate_count_total = candidatePool.size;
 
     if (!options.dryRun && candidatePool.size > 0) {
       const listingChecksum = checksumSha256(listing.html);
