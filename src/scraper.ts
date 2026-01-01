@@ -2,7 +2,7 @@ import { chromium, Browser, Page, Locator } from "playwright";
 import { ListingLink } from "./listing_http";
 import { checksumSha256 } from "./checksum";
 import { persistRaw } from "./persist";
-import { getClient } from "./db";
+import { getClient, closeClient } from "./db";
 import fs from "fs";
 import path from "path";
 import { URL } from "url";
@@ -42,6 +42,7 @@ const STORAGE_STATE_PATH = process.env.BOE_STORAGE_STATE || "/opt/adl-suite/data
 const STORAGE_STATE_DIR = path.dirname(STORAGE_STATE_PATH);
 const BOE_LOGIN_URL = process.env.BOE_LOGIN_URL || "https://subastas.boe.es/login.php";
 const BOE_PROXY = process.env.BOE_PROXY || "";
+const DEBUG_DIR = process.env.BOE_DEBUG_DIR || "/opt/adl-suite/data/boe_debug";
 
 const PDF_BUDGET = Number.isFinite(Number(process.env.BOE_PDF_DAILY_BUDGET))
   ? Math.max(Number(process.env.BOE_PDF_DAILY_BUDGET), 0)
@@ -53,6 +54,12 @@ const PDF_ONLY_ACTIVE = (process.env.BOE_PDF_ONLY_ACTIVE || "true").toLowerCase(
 const PDF_ONLY_INMUEBLE = (process.env.BOE_PDF_ONLY_INMUEBLE || "true").toLowerCase() === "true";
 const PDF_DRY_RUN = (process.env.BOE_PDF_DRY_RUN || "false").toLowerCase() === "true";
 const QUEUE_LIMIT = 200;
+const SEARCH_DAYS_BACK = Number.isFinite(Number(process.env.BOE_SEARCH_DAYS_BACK))
+  ? Math.max(Number(process.env.BOE_SEARCH_DAYS_BACK), 0)
+  : 30;
+const ZERO_RESULT_WAIT_MS = Number.isFinite(Number(process.env.BOE_ZERO_RESULT_WAIT_MS))
+  ? Math.max(Number(process.env.BOE_ZERO_RESULT_WAIT_MS), 1000)
+  : 30_000;
 
 function formatDateInput(date: Date): string {
   return date.toISOString().slice(0, 10);
@@ -230,9 +237,9 @@ async function ensureResults(page: Page): Promise<ListingLink[]> {
       .filter((h): h is string => Boolean(h))
   );
   if (!hrefs.length) {
-    console.log("[BOE] No results found. Sleeping before retry.");
-    // Zero results is a normal condition in 24/7 mode.
-    await safeWait(15 * 60 * 1000);
+    console.log("[BOE] No results found. Capturing debug artifacts and retrying soon.");
+    await captureZeroResults(page, "no_links_after_search");
+    await safeWait(30 * 1000);
     return [];
   }
 
@@ -255,12 +262,11 @@ type SubmitResult = { html: string; url: string; links: ListingLink[]; cookies: 
 
 async function submitSearch(page: Page): Promise<SubmitResult> {
   const end = addDays(new Date(), PDF_MAX_DAYS_AHEAD);
-  const start = new Date(); // activo: fecha_fin desde hoy
+  const start = addDays(new Date(), -SEARCH_DAYS_BACK);
 
   await page.goto(LISTING_URL, { waitUntil: "domcontentloaded" });
   await acceptCookies(page).catch(() => {});
   await clearProvince(page);
-  await setEstadoActivo(page);
   await setDateRange(page, start, end);
 
   const searchClick =
@@ -305,6 +311,26 @@ function ensureDir(dir: string) {
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
+}
+
+async function captureZeroResults(page: Page, reason: string): Promise<{ htmlPath: string; screenshotPath: string }> {
+  ensureDir(DEBUG_DIR);
+  const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  const htmlPath = path.join(DEBUG_DIR, `listing-${ts}.html`);
+  const screenshotPath = path.join(DEBUG_DIR, `listing-${ts}.png`);
+  const html = await page.content();
+  fs.writeFileSync(htmlPath, html, "utf8");
+  let shot = "";
+  try {
+    await page.screenshot({ path: screenshotPath, fullPage: true });
+    shot = screenshotPath;
+  } catch (err: any) {
+    console.warn(`[debug] screenshot failed reason=${err?.message || err}`);
+  }
+  console.log(
+    `[debug] ZERO_RESULTS_CAPTURE reason=${reason} url=${page.url()} html_len=${html.length} html=${htmlPath} screenshot=${shot || "none"}`
+  );
+  return { htmlPath, screenshotPath: shot };
 }
 
 function deriveBoeUid(url: string, html: string): string | null {
@@ -539,6 +565,34 @@ export async function runScrape(options: ScrapeOptions): Promise<void> {
   }
   const startedAt = Date.now();
   let requestCount = 0;
+  const runClient = await getClient();
+  await runClient.query(`CREATE EXTENSION IF NOT EXISTS "pgcrypto"`);
+  await runClient.query(`
+    CREATE TABLE IF NOT EXISTS public.pipeline_runs (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      pipeline TEXT NOT NULL,
+      started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      finished_at TIMESTAMPTZ,
+      status TEXT NOT NULL,
+      stats JSONB DEFAULT '{}'::jsonb,
+      error TEXT
+    )
+  `);
+  const runRes = await runClient.query(
+    `INSERT INTO pipeline_runs (pipeline, status, started_at, stats) VALUES ($1, 'running', now(), '{}'::jsonb) RETURNING id`,
+    ["boe-raw"]
+  );
+  const runId: string = runRes.rows[0].id;
+  const runStats: Record<string, unknown> = {
+    listing_links: 0,
+    listing_html_len: 0,
+    details_ok: 0,
+    queued: 0,
+    eligible: 0,
+    pdf_downloaded: 0,
+    pdf_failed: 0,
+    pdf_skipped: 0
+  };
 
   try {
     console.log(`[info] Inicio: listado Playwright + detalles Playwright (max ${maxPages})`);
@@ -547,6 +601,8 @@ export async function runScrape(options: ScrapeOptions): Promise<void> {
     console.log(`[info] Listado obtenido desde ${listing.url}, html=${listing.html.length} chars`);
     console.log(`[info] Enlaces de detalle detectados: ${listing.links.length}`);
     const idBusListado = (listing as any).idBusqueda || null;
+    runStats.listing_links = listing.links.length;
+    runStats.listing_html_len = listing.html.length;
 
     if (!options.dryRun) {
       const listingChecksum = checksumSha256(listing.html);
@@ -554,9 +610,12 @@ export async function runScrape(options: ScrapeOptions): Promise<void> {
     }
 
     if (listing.links.length === 0) {
-      console.log("[BOE] No results after search. Sleeping before retry.");
-      // Zero results is a normal condition in 24/7 mode.
-      await safeWait(15 * 60 * 1000);
+      console.log("[BOE] No results after search. Short sleep and exit.");
+      await runClient.query(
+        `UPDATE pipeline_runs SET status='empty', finished_at=now(), stats=$2 WHERE id=$1`,
+        [runId, JSON.stringify(runStats)]
+      );
+      await safeWait(ZERO_RESULT_WAIT_MS);
       return;
     }
 
@@ -643,6 +702,7 @@ export async function runScrape(options: ScrapeOptions): Promise<void> {
 
       requestCount += 1;
     }
+    runStats.details_ok = detailRecords.length;
 
     // Cola priorizada de PDFs
     const nowDate = new Date();
@@ -667,6 +727,8 @@ export async function runScrape(options: ScrapeOptions): Promise<void> {
     console.log(
       `QUEUE | listed_total=${selected.length} | eligible=${queue.length} | queued=${queue.length} | window_days=${PDF_MAX_DAYS_AHEAD}`
     );
+    runStats.queued = queue.length;
+    runStats.eligible = queue.length;
 
     let budget = PDF_BUDGET;
     let pdfDownloaded = 0;
@@ -718,12 +780,26 @@ export async function runScrape(options: ScrapeOptions): Promise<void> {
         }
       }
     }
+    runStats.pdf_downloaded = pdfDownloaded;
+    runStats.pdf_failed = pdfFailed;
+    runStats.pdf_skipped = pdfSkipped;
 
     console.log(
       `RUN_OK | listed=${listing.links.length} | eligible=${queue.length} | queued=${queue.length} | pdf_downloaded=${pdfDownloaded} | pdf_failed=${pdfFailed} | pdf_skipped=${pdfSkipped} | dry_run=${PDF_DRY_RUN}`
     );
+    await runClient.query(
+      `UPDATE pipeline_runs SET status='ok', finished_at=now(), stats=$2 WHERE id=$1`,
+      [runId, JSON.stringify(runStats)]
+    );
+  } catch (err: any) {
+    await runClient.query(
+      `UPDATE pipeline_runs SET status='error', finished_at=now(), stats=$3, error=$2 WHERE id=$1`,
+      [runId, String(err?.message || err), JSON.stringify(runStats)]
+    );
+    throw err;
   } finally {
     await browser.close();
+    await closeClient();
   }
 }
 
