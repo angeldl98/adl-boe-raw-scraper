@@ -60,6 +60,12 @@ const SEARCH_DAYS_BACK = Number.isFinite(Number(process.env.BOE_SEARCH_DAYS_BACK
 const ZERO_RESULT_WAIT_MS = Number.isFinite(Number(process.env.BOE_ZERO_RESULT_WAIT_MS))
   ? Math.max(Number(process.env.BOE_ZERO_RESULT_WAIT_MS), 1000)
   : 30_000;
+const MAX_CANDIDATES = Number.isFinite(Number(process.env.BOE_MAX_CANDIDATES))
+  ? Math.max(1, Number(process.env.BOE_MAX_CANDIDATES))
+  : 100;
+const INFER_LOOKBACK = Number.isFinite(Number(process.env.BOE_INFER_LOOKBACK))
+  ? Math.max(1, Number(process.env.BOE_INFER_LOOKBACK))
+  : 50;
 
 function formatDateInput(date: Date): string {
   return date.toISOString().slice(0, 10);
@@ -333,6 +339,106 @@ async function captureZeroResults(page: Page, reason: string): Promise<{ htmlPat
   return { htmlPath, screenshotPath: shot };
 }
 
+type CandidateSource = "dom" | "xhr" | "inferred";
+type Candidate = { url: string; source: CandidateSource };
+
+function normalizeDetailUrl(urlStr: string): string | null {
+  try {
+    const u = new URL(urlStr, BASE_URL);
+    if (!u.pathname.includes("detalleSubasta.php")) return null;
+    if (!u.searchParams.get("idSub")) return null;
+    u.searchParams.set("ver", u.searchParams.get("ver") || "1");
+    return u.toString();
+  } catch {
+    return null;
+  }
+}
+
+function extractIdSub(urlStr: string): string | null {
+  try {
+    const u = new URL(urlStr, BASE_URL);
+    return u.searchParams.get("idSub");
+  } catch {
+    return null;
+  }
+}
+
+function domFingerprint(html: string): string {
+  const normalized = html.replace(/\s+/g, " ").trim();
+  return checksumSha256(normalized);
+}
+
+async function collectNetworkCandidates(page: Page): Promise<Set<string>> {
+  const urls = new Set<string>();
+  page.on("response", (resp) => {
+    try {
+      const url = resp.url();
+      if (
+        url.includes("detalleSubasta") ||
+        url.includes("subastas_ava") ||
+        url.includes("subastas")
+      ) {
+        const norm = normalizeDetailUrl(url);
+        if (norm) urls.add(norm);
+      }
+    } catch {
+      /* ignore */
+    }
+  });
+  return urls;
+}
+
+async function collectInferredCandidates(): Promise<Set<string>> {
+  const urls = new Set<string>();
+  const client = await getClient();
+  const res = await client.query(
+    `SELECT url FROM boe_subastas_raw WHERE url LIKE '%idSub=%' ORDER BY fetched_at DESC LIMIT $1`,
+    [INFER_LOOKBACK]
+  );
+  const seenPrefixes = new Set<string>();
+  for (const row of res.rows) {
+    const id = extractIdSub(row.url);
+    if (!id) continue;
+    const m = id.match(/(SUB-[A-Z]{2}-\d{4})-(\d+)/i);
+    if (!m) continue;
+    const prefix = m[1];
+    const num = Number(m[2]);
+    if (!Number.isFinite(num)) continue;
+    seenPrefixes.add(prefix);
+    for (const delta of [1, 2]) {
+      const next = `${prefix}-${num + delta}`;
+      const url = `${BASE_URL}/detalleSubasta.php?idSub=${encodeURIComponent(next)}`;
+      urls.add(url);
+    }
+  }
+
+  // Validate inferred URLs with lightweight GET
+  const valid = new Set<string>();
+  for (const u of urls) {
+    try {
+      const resp = await fetch(u, { method: "GET" });
+      if (!resp.ok) continue;
+      const text = await resp.text();
+      if (text && text.length > 500) valid.add(normalizeDetailUrl(u) as string);
+    } catch {
+      continue;
+    }
+  }
+  return valid;
+}
+
+function validateDetailHtml(html: string, url: string): { ok: boolean; reason?: string } {
+  const boeUid = deriveBoeUid(url, html);
+  if (!boeUid) return { ok: false, reason: "missing_boe_uid" };
+  const fecha = parseDateFromDetail(html);
+  if (!fecha) return { ok: false, reason: "missing_date" };
+  const tipo = extractTipoBien(html);
+  if (!tipo) return { ok: false, reason: "missing_tipo" };
+  const authorityMatch = html.match(/Juzgado|Órgano|Autoridad|Entidad/i);
+  if (!authorityMatch) return { ok: false, reason: "missing_authority" };
+  return { ok: true };
+}
+
 function deriveBoeUid(url: string, html: string): string | null {
   const candidates = [url, html];
   for (const src of candidates) {
@@ -591,11 +697,21 @@ export async function runScrape(options: ScrapeOptions): Promise<void> {
     eligible: 0,
     pdf_downloaded: 0,
     pdf_failed: 0,
-    pdf_skipped: 0
+    pdf_skipped: 0,
+    found_dom: 0,
+    found_xhr: 0,
+    found_inferred: 0,
+    validated: 0,
+    discarded: 0,
+    mode: "normal",
+    evidence_html: "",
+    evidence_screenshot: "",
+    dom_fingerprint: ""
   };
 
   try {
     console.log(`[info] Inicio: listado Playwright + detalles Playwright (max ${maxPages})`);
+    const xhrCandidates = await collectNetworkCandidates(page);
     const listing = await fetchListingWithPlaywright(page);
     requestCount += 1;
     console.log(`[info] Listado obtenido desde ${listing.url}, html=${listing.html.length} chars`);
@@ -603,23 +719,53 @@ export async function runScrape(options: ScrapeOptions): Promise<void> {
     const idBusListado = (listing as any).idBusqueda || null;
     runStats.listing_links = listing.links.length;
     runStats.listing_html_len = listing.html.length;
+    runStats.found_dom = listing.links.length;
+    runStats.found_xhr = xhrCandidates.size;
 
-    if (!options.dryRun) {
+    // Método C: inferencia por continuidad
+    const inferred = await collectInferredCandidates();
+    runStats.found_inferred = inferred.size;
+
+    // Pool de candidatos
+    const candidatePool = new Map<string, Candidate>();
+    const pushCandidate = (url: string, source: CandidateSource) => {
+      if (!url) return;
+      const norm = normalizeDetailUrl(url);
+      if (!norm) return;
+      if (candidatePool.size >= MAX_CANDIDATES && !candidatePool.has(norm)) return;
+      if (!candidatePool.has(norm)) candidatePool.set(norm, { url: norm, source });
+    };
+
+    listing.links.forEach((l) => pushCandidate(l.absolute, "dom"));
+    xhrCandidates.forEach((u) => pushCandidate(u, "xhr"));
+    inferred.forEach((u) => pushCandidate(u, "inferred"));
+
+    if (!options.dryRun && candidatePool.size > 0) {
       const listingChecksum = checksumSha256(listing.html);
       await persistRaw({ url: listing.url, payload: listing.html, checksum: listingChecksum, source: "BOE_LISTING" });
     }
 
-    if (listing.links.length === 0) {
-      console.log("[BOE] No results after search. Short sleep and exit.");
+    if (candidatePool.size === 0) {
+      console.log("[BOE] No candidates from DOM/XHR/inferred. Degraded mode.");
+      runStats.mode = "degraded";
+      const capture = await captureZeroResults(page, "no_candidates");
+      runStats.evidence_html = capture.htmlPath;
+      runStats.evidence_screenshot = capture.screenshotPath;
+      runStats.dom_fingerprint = domFingerprint(listing.html);
       await runClient.query(
-        `UPDATE pipeline_runs SET status='empty', finished_at=now(), stats=$2 WHERE id=$1`,
+        `UPDATE pipeline_runs SET status='degraded', finished_at=now(), stats=$2 WHERE id=$1`,
         [runId, JSON.stringify(runStats)]
       );
       await safeWait(ZERO_RESULT_WAIT_MS);
       return;
     }
 
-    const selected: ListingLink[] = listing.links.slice(0, maxDetails);
+    const selectedCandidates = Array.from(candidatePool.values()).slice(0, maxDetails);
+    const selected: ListingLink[] = selectedCandidates.map((c) => ({
+      absolute: c.url,
+      href: c.url,
+      text: ""
+    }));
     const detailRecords: Array<{
       link: ListingLink;
       rawId: number;
@@ -681,11 +827,19 @@ export async function runScrape(options: ScrapeOptions): Promise<void> {
             )} €</div>\n`
           : detailHtml;
 
-      const rawId = options.dryRun ? -1 : await persistRaw({ url: page.url(), payload: augmentedHtml, checksum, source: "BOE_DETAIL" });
       const boeUid = deriveBoeUid(page.url(), augmentedHtml);
       const fechaFin = parseDateFromDetail(augmentedHtml);
       const tipo = extractTipoBien(augmentedHtml);
       const subastaId = parseInt(new URL(page.url()).searchParams.get("idSub") || "", 10);
+      const validation = validateDetailHtml(augmentedHtml, page.url());
+      if (!validation.ok) {
+        runStats.discarded = (runStats.discarded as number) + 1;
+        console.warn(`[warn] detail_discarded reason=${validation.reason || "unknown"} url=${page.url()}`);
+        continue;
+      }
+      runStats.validated = (runStats.validated as number) + 1;
+
+      const rawId = options.dryRun ? -1 : await persistRaw({ url: page.url(), payload: augmentedHtml, checksum, source: "BOE_DETAIL" });
       detailRecords.push({
         link,
         rawId,
@@ -785,7 +939,7 @@ export async function runScrape(options: ScrapeOptions): Promise<void> {
     runStats.pdf_skipped = pdfSkipped;
 
     console.log(
-      `RUN_OK | listed=${listing.links.length} | eligible=${queue.length} | queued=${queue.length} | pdf_downloaded=${pdfDownloaded} | pdf_failed=${pdfFailed} | pdf_skipped=${pdfSkipped} | dry_run=${PDF_DRY_RUN}`
+      `RUN_OK | listed=${candidatePool.size} | eligible=${queue.length} | queued=${queue.length} | pdf_downloaded=${pdfDownloaded} | pdf_failed=${pdfFailed} | pdf_skipped=${pdfSkipped} | dry_run=${PDF_DRY_RUN}`
     );
     await runClient.query(
       `UPDATE pipeline_runs SET status='ok', finished_at=now(), stats=$2 WHERE id=$1`,
