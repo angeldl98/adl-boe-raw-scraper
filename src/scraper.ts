@@ -953,11 +953,23 @@ export async function runScrape(options: ScrapeOptions): Promise<void> {
       );
     }
   } catch (err: any) {
-    await runClient.query(
-      `UPDATE pipeline_runs SET status='error', finished_at=now(), stats=$3, error=$2 WHERE id=$1`,
-      [runId, String(err?.message || err), JSON.stringify(runStats)]
-    );
-    throw err;
+    const hadCandidates = (runStats.candidate_count_total as number) > 0;
+    const validationOnly =
+      typeof err?.message === "string" && err.message.startsWith("DETAIL_VALIDATION_FAILED");
+    const noneValidated = (runStats.validated as number) === 0;
+    if (hadCandidates && noneValidated && validationOnly) {
+      runStats.mode = "degraded";
+      await runClient.query(
+        `UPDATE pipeline_runs SET status='degraded', finished_at=now(), stats=$2 WHERE id=$1`,
+        [runId, JSON.stringify(runStats)]
+      );
+    } else {
+      await runClient.query(
+        `UPDATE pipeline_runs SET status='error', finished_at=now(), stats=$3, error=$2 WHERE id=$1`,
+        [runId, String(err?.message || err), JSON.stringify(runStats)]
+      );
+      throw err;
+    }
   } finally {
     await browser.close();
     await closeClient();
