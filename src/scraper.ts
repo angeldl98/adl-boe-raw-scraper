@@ -230,7 +230,10 @@ async function ensureResults(page: Page): Promise<ListingLink[]> {
       .filter((h): h is string => Boolean(h))
   );
   if (!hrefs.length) {
-    throw new Error("ZERO_LINKS_AFTER_SEARCH");
+    console.log("[BOE] No results found. Sleeping before retry.");
+    // Zero results is a normal condition in 24/7 mode.
+    await safeWait(15 * 60 * 1000);
+    return [];
   }
 
   const seen = new Set<string>();
@@ -551,7 +554,10 @@ export async function runScrape(options: ScrapeOptions): Promise<void> {
     }
 
     if (listing.links.length === 0) {
-      throw new Error("ZERO_LINKS_AFTER_SEARCH: do not retry, do not advance dates");
+      console.log("[BOE] No results after search. Sleeping before retry.");
+      // Zero results is a normal condition in 24/7 mode.
+      await safeWait(15 * 60 * 1000);
+      return;
     }
 
     const selected: ListingLink[] = listing.links.slice(0, maxDetails);
