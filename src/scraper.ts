@@ -7,8 +7,8 @@ import fs from "fs";
 import path from "path";
 import { URL } from "url";
 // eslint-disable-next-line @typescript-eslint/no-var-requires
-const pdfParse = require("pdf-parse");
-
+// PDF parsing intentionally removed from raw stage.
+// Parsing will be handled by normalizer/analyst.
 const DISABLE_PDF_PARSE = process.env.DISABLE_PDF_PARSE === "true";
 
 const BASE_URL = process.env.BOE_BASE_URL || "https://subastas.boe.es";
